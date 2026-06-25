@@ -1,0 +1,101 @@
+Nome,Tipo,Valencia,Arousal,Duracao,Indoor,Tag,Oitante
+Caminhada Rápida no Parque,Corporal,0.42,0.45,20,0,Natureza,1
+Áudio de Chuva Suave,Áudio,0.03,-0.42,15,1,Relaxamento,7
+Compilação de Gatos Brincando,Vídeo,0.88,0.04,5,1,Animais,8
+Body Scan (Escaneamento Corporal),Mindfulness,0.35,-0.85,15,1,Relaxamento,7
+Foto de Paisagem de Montanha,Imagem,0.25,-0.30,2,1,Natureza,7
+Sudoku Nível Médio,Jogo,-0.02,0.02,10,1,Cognitivo,2
+Alongamento de Yoga,Corporal,0.48,-0.25,15,1,Relaxamento,8
+Música Pop Animada (Upbeat),Áudio,0.75,0.48,4,1,Energético,1
+Clipe de Recife de Coral,Vídeo,0.30,-0.35,8,1,Natureza,7
+Respiração 4-7-8,Mindfulness,0.40,-0.45,5,1,Relaxamento,7
+Tetris (Modo Clássico),Jogo,0.28,0.05,10,1,Lúdico,8
+Fotos de Filhotes de Cachorro,Imagem,0.90,0.03,3,1,Animais,8
+Polichinelos (Série Curta),Corporal,0.33,0.88,2,1,Intenso,2
+Visualização Guiada (Floresta),Áudio,0.45,-0.38,12,1,Audioterapia,7
+Trecho de Stand-up Comedy,Vídeo,0.82,0.42,10,1,Comédia,1
+Padrões Geométricos Azuis,Imagem,0.00,-0.20,1,1,Abstrato,7
+Jardinagem / Regar Plantas,Corporal,0.41,-0.15,20,0,Natureza,8
+Paciência (Solitaire),Jogo,0.05,-0.28,10,1,Lúdico,7
+Mindful Eating (Passas/Chocolate),Mindfulness,0.38,-0.32,5,1,Foco,7
+Vídeo Satisfatório (Areia Cinética),Vídeo,0.29,-0.40,3,1,Satisfatório,7
+Dança Livre na Sala,Corporal,0.85,0.47,5,1,Energético,1
+Som de Ondas do Mar,Áudio,0.46,-0.44,20,1,Natureza,7
+Timelapse do Céu Estrelado,Vídeo,0.04,-0.48,3,1,Natureza,7
+Diário de Gratidão (3 itens),Mindfulness,0.50,-0.22,10,1,Reflexão,8
+Imagem de Galáxia Nebulosa,Imagem,0.22,-0.35,1,1,Abstrato,7
+Quebra-Cabeça Digital,Jogo,0.01,-0.18,15,1,Lúdico,7
+Tai Chi (Movimentos Básicos),Corporal,0.39,-0.30,10,1,Relaxamento,7
+Podcast de Curiosidades,Áudio,0.08,0.01,20,1,Cognitivo,8
+Restauração de Antiguidades,Vídeo,0.31,-0.33,10,1,Satisfatório,7
+Meditação Metta (Amor-Bondade),Mindfulness,0.78,-0.41,15,1,Relaxamento,8
+Jogo de Ritmo/Dança,Jogo,0.72,0.45,5,1,Lúdico,1
+Pintura Impressionista (Lírios),Imagem,0.26,-0.29,2,1,Arte,7
+Corrida Leve na Rua,Corporal,0.44,0.49,20,0,Fitness,1
+Som de Fogueira Crepitando,Áudio,0.37,-0.36,15,1,Aconchego,7
+Curta-metragem Emocionante,Vídeo,0.34,0.03,6,1,Drama,8
+Textura de Madeira Rústica,Imagem,-0.01,-0.45,1,1,Natureza,6
+Automassagem nos Pés,Corporal,0.49,-0.38,10,1,Relaxamento,7
+Xadrez (Partida Rápida),Jogo,0.02,0.40,10,1,Cognitivo,2
+Técnica dos 5 Sentidos,Mindfulness,0.00,-0.25,5,1,Foco,7
+Vídeo de "Fails" Leves,Vídeo,0.47,0.04,5,1,Comédia,8
+Yoga Facial,Corporal,0.32,-0.20,5,1,Relaxamento,8
+ASMR de Corte de Sabão,Vídeo,0.28,-0.42,5,1,Satisfatório,7
+Jogo da Memória,Jogo,0.03,0.02,8,1,Cognitivo,2
+Ruído Branco (White Noise),Áudio,-0.03,-0.15,20,1,Foco,6
+Escrita Livre (3 Páginas),Mindfulness,0.21,0.03,10,1,Reflexão,8
+Colorir Mandala Digital,Jogo,0.36,-0.35,15,1,Arte,7
+Foto de Aurora Boreal,Imagem,0.81,-0.38,2,1,Natureza,8
+Saltar à Corda,Corporal,0.43,0.90,3,0,Fitness,2
+Trecho de Doc. sobre o Cosmos,Vídeo,0.05,-0.45,10,1,Natureza,7
+Observação de Nuvens,Mindfulness,0.19,-0.80,5,0,Natureza,7
+Jazz Suave Instrumental,Áudio,0.40,-0.33,20,1,Relaxamento,8
+Palavras Cruzadas,Jogo,0.04,0.01,15,1,Cognitivo,2
+Movimento Consciente (Sentado),Corporal,0.27,-0.28,5,1,Relaxamento,7
+Canto de Pássaros na Floresta,Áudio,0.45,-0.30,15,1,Natureza,8
+Vídeo de Caligrafia Artística,Vídeo,0.33,-0.39,4,1,Arte,7
+Imagem de Praia Tropical,Imagem,0.50,-0.35,2,1,Natureza,8
+Alongamento Pescoço/Ombros,Corporal,0.24,-0.22,3,1,Relaxamento,7
+Meditação da Vela (Trataka),Mindfulness,0.00,-0.18,10,1,Foco,7
+Jogo de Objetos Escondidos,Jogo,0.22,0.04,10,1,Lúdico,8
+Foto de Arquitetura Futurista,Imagem,0.02,0.00,1,1,Arte,8
+Origami de Tsuru,Jogo,0.35,-0.15,10,1,Manual/Arte,8
+Caminhada Descalço na Grama,Corporal,0.41,-0.25,15,0,Natureza,8
+Áudio de Trovoadas Distantes,Áudio,-0.04,-0.41,20,1,Aconchego,6
+Vídeo de Dominó Caindo,Vídeo,0.29,-0.35,4,1,Satisfatório,7
+Scan de Gratidão Corporal,Mindfulness,0.48,-0.82,10,1,Auto-compaixão,7
+Imagem de Comida Reconfortante,Imagem,0.42,0.02,1,1,Conforto,8
+Pular em um Pé Só,Corporal,0.38,0.44,2,1,Lúdico,1
+Jogo das 7 Diferenças,Jogo,0.06,0.03,5,1,Cognitivo,8
+Sons de Cafeteria/Bistrô,Áudio,0.01,-0.12,30,1,Ambiente,6
+Vídeo de Pouso de Avião (Cockpit),Vídeo,0.03,0.01,10,1,Curiosidade,8
+Mindfulness do Tato (Objeto),Mindfulness,0.00,-0.45,5,1,Sensorial,6
+Imagem de Arte Abstrata Colorida,Imagem,0.23,0.04,2,1,Arte,8
+Agachamentos (Squats),Corporal,0.30,0.48,3,1,Fitness,2
+Música Clássica (Piano),Áudio,0.46,-0.38,15,1,Relaxamento,8
+Trailer de Filme de Ação,Vídeo,0.44,0.46,3,1,Entretenimento,1
+Jogo de Labirinto,Jogo,0.02,0.05,5,1,Cognitivo,2
+Abraço de Borboleta (Técnica),Corporal,0.39,-0.35,3,1,Regulação,7
+Observar Insetos/Formigas,Mindfulness,-0.02,-0.20,10,0,Natureza,6
+Foto de Multidão em Festival,Imagem,0.20,0.41,1,1,Social,2
+Áudio de Risadas de Bebê,Áudio,0.89,0.05,2,1,Alegria,8
+Aula de Zumba,Corporal,0.85,0.80,45,1,Energético,1
+Vídeo de Montanha-Russa POV,Vídeo,0.75,0.85,3,1,Adrenalina,1
+Cantar Karaoke (Rock/Pop),Corporal,0.80,0.70,10,1,Diversão,1
+Pular em Cama Elástica,Corporal,0.78,0.75,10,0,Lúdico,1
+Corrida de Kart,Corporal,0.70,0.80,20,0,Adrenalina,1
+Assistir Final de Campeonato,Vídeo,0.82,0.78,15,1,Emoção,1
+Riso Forçado (Laughter Yoga),Corporal,0.65,0.65,5,1,Alegria,1
+Sprinting (Tiros de Corrida),Corporal,0.25,0.95,10,0,Fitness,2
+Jogo de FPS Competitivo,Jogo,0.10,0.90,15,1,Foco,2
+Banho Gelado (Choque),Corporal,0.15,0.85,2,1,Ativação,2
+Bateria (Instrumento Musical),Corporal,0.35,0.80,15,1,Expressão,2
+Debate Intenso (Podcast),Áudio,0.05,0.75,20,1,Cognitivo,2
+Escalada (Bouldering),Corporal,0.40,0.85,30,1,Desafio,2
+Trailer de Filme de Terror,Vídeo,-0.25,0.88,2,1,Medo/Excitação,3
+Heavy Metal Intenso,Áudio,-0.15,0.85,5,1,Energia,3
+Prancha Abdominal (Até a falha),Corporal,-0.40,0.82,2,1,Desafio,3
+Jogo de Desarmar Bomba,Jogo,-0.10,0.90,5,1,Tensão,3
+Gritar no Travesseiro,Corporal,-0.20,0.75,1,1,Liberação,3
+Sirene de Alerta (Efeito Sonoro),Áudio,-0.50,0.90,1,1,Alerta,3
+Boxe no Saco de Pancada,Corporal,-0.10,0.90,10,1,Liberação,3
