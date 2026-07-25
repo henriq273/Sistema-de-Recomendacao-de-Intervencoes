@@ -1,10 +1,5 @@
-# -*- coding: utf-8 -*-
 """
-Sistema de Recomendação de Intervenções — v2 (arquivo único)
-
-Este arquivo reúne, em um único módulo executável, as funcionalidades que no
-projeto vivem separadas em config.py, core.py, agent.py, policy.py,
-simulator.py, evaluation.py e app.py:
+Sistema de Recomendação de Intervenções — v3
 
   - Configuração central (constantes de rede, RL, PER, guardrail, etc.)
   - Núcleo: carga do dataset, geometria dos oitantes (Circumplexo) e
@@ -16,9 +11,6 @@ simulator.py, evaluation.py e app.py:
   - Simulador e avaliação offline — bancada de teste, não fazem parte do
     caminho de produção (nunca usados para treinar o modelo real)
   - CLI interativo e ponto de entrada
-
-Os módulos separados continuam existindo no projeto; este arquivo é uma
-consolidação para quem precisar de uma versão única e autocontida.
 """
 import json
 import os
@@ -32,58 +24,51 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-
-# =====================================================================
-# Configuração (antes em config.py)
-# =====================================================================
-# Não usar argparse: sys.argv já vem preenchido com argumentos do kernel em
-# Google Colab/Jupyter, o que quebra o parse. Toda configuração fica aqui.
-
-# ---------- Dados ----------
+# Dataset 
 DATASET_PATH = "dataset.csv"   # nome simples ou caminho absoluto (ex.: caminho do Drive)
 
-# ---------- Reprodutibilidade ----------
+# Reprodutibilidade
 SEED = 42
 
-# ---------- Rede e otimização ----------
+# Rede e otimização
 HIDDEN_DIMS = (128, 64, 32)
 DROPOUT = 0.2
 LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 1e-5
 BATCH_SIZE = 64
 GRAD_CLIP_NORM = 1.0
-TARGET_TAU = 0.005          # soft update (Polyak) da target network
+TARGET_TAU = 0.005
 
-# ---------- RL ----------
-GAMMA = 0.90                # irrelevante em BANDIT_MODE=True; mantido para o caminho alternativo
+# RL
 BANDIT_MODE = True          # True: alvo = recompensa (cada recomendação é episódio fechado)
 UPDATES_PER_FEEDBACK = 3    # passos de replay por feedback recebido
+GAMMA = 0.99                   # fator de desconto do futuro (0 = só recompensa imediata)
 
-# ---------- Prioritized Experience Replay ----------
+# Prioritized Experience Replay
 MEMORY_CAPACITY = 5000
 PER_ALPHA = 0.6              # 0 = uniforme, 1 = priorização total
 PER_BETA = 0.4                # correção de viés de importance sampling (cresce até 1)
 PER_BETA_INCREMENT = 1e-4
 PER_EPSILON = 1e-5           # evita prioridade zero
 
-# ---------- Alvo afetivo ----------
+# Alvo afetivo
 # Ponto-alvo no plano (V,A) = atual + ISO_ALPHA * (desejado - atual)
-#   ISO_ALPHA = 1.0 -> mira exatamente o oitante desejado (padrão do projeto)
+#   ISO_ALPHA = 1.0 -> mira exatamente o oitante desejado
 #   ISO_ALPHA < 1.0 -> princípio-iso: mira um ponto intermediário, aproximação gradual
 ISO_ALPHA = 1.0
 
-# ---------- Conjunto de candidatos ----------
+# Conjunto de candidatos
 CANDIDATE_POOL_SIZE = 12    # M itens mais próximos do ponto-alvo entram no pool
 
-# ---------- Guardrail de segurança ----------
+# Guardrail de segurança
 USE_SAFETY_FILTER = True
 LOW_ENERGY_OCTANTS = (5, 6)      # Triste/Deprimido, Entediado/Cansado
 SAFETY_AROUSAL_THRESHOLD = 0.6   # itens acima disso são bloqueados nesses estados
 
-# ---------- Cold-start (mistura heurística -> DQN) ----------
-WARMUP_INTERACTIONS = 50    # nº de feedbacks reais até confiar 100% na DQN
+# Cold-start (heurística -> DQN)
+WARMUP_INTERACTIONS = 50    # num. de feedbacks reais até confiar totalmente no DQN 
 
-# ---------- Anti-monotonia ----------
+# Anti-monotonia
 SOFTMAX_TEMPERATURE = 0.3   # temperatura do sorteio do slot 1 (menor = mais guloso)
 EXPLORE_TEMPERATURE = 1.0   # temperatura do slot exploratório (maior = mais diverso)
 P_EXPLORE_SLOT = 0.5        # probabilidade de um dos slots ser exploratório
@@ -92,14 +77,9 @@ FATIGUE_LAMBDA = 0.5        # peso máximo da penalidade de fadiga
 FATIGUE_HALFLIFE = 10       # em nº de interações; meia-vida do decaimento da penalidade
 TOP_K = 3                   # itens recomendados por vez
 
-# ---------- Persistência ----------
+# Persistência - conservar pesos, histórico de treino e log de interações
 CHECKPOINT_PATH = "checkpoint_v3.pt"
 INTERACTION_LOG_PATH = "interaction_log.jsonl"
-
-
-# =====================================================================
-# Núcleo: dados, geometria dos oitantes e features (antes em core.py)
-# =====================================================================
 
 # Centroides dos oitantes no plano (Valência, Arousal) do Modelo Circumplexo de Emoções.
 OCTANT_MAP = {
@@ -128,7 +108,8 @@ EXPECTED_COLUMNS = ["Nome", "Tipo", "Valencia", "Arousal", "Duracao", "Indoor", 
 
 
 def set_seed(seed: int = SEED) -> None:
-    """Fixa a semente de todas as fontes de aleatoriedade usadas no projeto."""
+    """Fixa a semente de todas as fontes de aleatoriedade usadas no projeto 
+    (para fins de reprodutibilidade)."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -140,7 +121,7 @@ def resolve_dataset_path(path: str = DATASET_PATH) -> str:
     """
     Localiza o CSV do catálogo testando, em ordem: o caminho dado; a variável de
     ambiente INTERVENTIONS_DATASET; a pasta do próprio módulo; o diretório de
-    trabalho atual; e o caminho padrão do Google Drive (Colab).
+    trabalho atual; e o caminho padrão do Google Drive (Colab) (fallback final).
     """
     filename = os.path.basename(path)
     candidates = [path]
@@ -206,9 +187,7 @@ def distance_to_point(df: pd.DataFrame, point: np.ndarray) -> np.ndarray:
 
 def nearest_octant(v: float, a: float) -> int:
     """
-    Oitante cujo centroide é mais próximo de (v, a). Apenas para diagnóstico e testes
-    de aceitação — a coluna Oitante concorda com este cálculo em só 82% dos casos, e o
-    caminho de recomendação usa sempre distance_to_point, nunca esta função.
+    Oitante cujo centroide é mais próximo de (v, a).
     """
     point = np.array([v, a], dtype=np.float32)
     return min(
@@ -221,8 +200,8 @@ class FeatureSpace:
     """Engenharia de features dos itens e do estado do usuário, com mapeamento estável."""
 
     def __init__(self, df: pd.DataFrame):
-        # sorted() torna o mapeamento independente da ordem das linhas do CSV: sem isso,
-        # reordenar o dataset invalidaria silenciosamente checkpoints salvos.
+        """sorted() torna o mapeamento independente da ordem das linhas do CSV: sem isso,
+        reordenar o dataset invalidaria silenciosamente checkpoints salvos."""
         self.all_types = sorted(df["Tipo"].unique().tolist())
         self.all_tags = sorted(df["Tag"].unique().tolist())
         self.max_duration = float(df["Duracao"].max())
@@ -249,7 +228,7 @@ class FeatureSpace:
         return matrix
 
     def user_state(self, curr_oct: int, dest_oct: int, time_avail: float) -> np.ndarray:
-        """[ one-hot(oitante atual) (8) | one-hot(oitante desejado) (8) | tempo normalizado (1) ]"""
+        # [ one-hot(oitante atual) (8) | one-hot(oitante desejado) (8) | tempo normalizado (1) ]
         state = np.zeros(17, dtype=np.float32)
         state[curr_oct - 1] = 1.0
         state[8 + dest_oct - 1] = 1.0
@@ -285,9 +264,7 @@ class FeatureSpace:
             raise ValueError("Checkpoint incompatível: max_duration divergente do dataset atual.")
 
 
-# =====================================================================
-# Agente: rede neural, replay priorizado e DQN content-aware (antes em agent.py)
-# =====================================================================
+# Agente: rede neural, replay priorizado e DQN content-aware
 
 Transition = namedtuple(
     "Transition", ("user_state", "item_features", "reward", "next_user_state", "done")
@@ -306,8 +283,8 @@ class ContentAwareDQN(nn.Module):
         h1, h2, h3 = HIDDEN_DIMS
         self.net = nn.Sequential(
             nn.Linear(input_dim, h1),
-            # LayerNorm, não BatchNorm1d: normaliza por amostra, é indiferente ao
-            # tamanho do batch e se comporta igual em treino e inferência — necessário
+            # LayerNorm: normaliza por amostra, é indiferente ao tamanho 
+            # do batch e se comporta igual em treino e inferência. Faz-se necessaśrio
             # porque o sistema alterna entre replay em lote e atualização online.
             nn.LayerNorm(h1),
             nn.ReLU(inplace=True),
@@ -332,7 +309,7 @@ class ContentAwareDQN(nn.Module):
 
 class PrioritizedReplayBuffer:
     """
-    Replay priorizado proporcional (Schaul et al., 2016).
+    Replay priorizado proporcional.
 
     Com poucos itens no catálogo e feedback humano caro de coletar, não se pode
     desperdiçar atualizações em transições já aprendidas: o PER concentra o esforço
@@ -348,8 +325,7 @@ class PrioritizedReplayBuffer:
         self.beta = PER_BETA
 
     def push(self, transition: Transition) -> None:
-        # Prioridade máxima corrente garante que toda transição nova seja amostrada
-        # ao menos uma vez.
+        # Prioridade máxima corrente garante que toda transição nova seja amostrada ao menos uma vez.
         max_priority = self.priorities[: len(self.memory)].max() if self.memory else 1.0
         if len(self.memory) < self.capacity:
             self.memory.append(transition)
@@ -379,7 +355,7 @@ class PrioritizedReplayBuffer:
 
 
 class Agent:
-    """Agente DQN content-aware: calcula Q-values e aprende com feedback real."""
+    # Agente DQN content-aware: calcula Q-values e aprende com feedback real.
 
     def __init__(self, df: pd.DataFrame, feature_space: FeatureSpace):
         if len(df) != feature_space.item_matrix.shape[0]:
@@ -407,7 +383,7 @@ class Agent:
 
     @torch.no_grad()
     def q_values(self, user_state: np.ndarray, item_indices: np.ndarray) -> np.ndarray:
-        """Q-value da rede de política para cada item candidato, dado o estado do usuário."""
+        # Q-value da rede de política para cada item candidato, dado o estado do usuário.
         self.policy_net.eval()
         user_repeat = np.repeat(user_state.reshape(1, -1), len(item_indices), axis=0)
         item_feats = self.feature_space.item_features(item_indices)
@@ -416,14 +392,14 @@ class Agent:
 
     def store(self, user_state: np.ndarray, item_idx: int, reward: float,
               next_user_state: np.ndarray, done: bool = True) -> None:
-        """Empilha uma transição no buffer de replay."""
+        # Empilha uma transição no buffer de replay.
         if BANDIT_MODE:
             done = True
         item_features = self.feature_space.item_features(np.array([item_idx]))[0]
         self.memory.push(Transition(user_state, item_features, reward, next_user_state, done))
 
     def replay(self) -> float:
-        """Um passo de treino a partir de um minibatch priorizado. 0.0 se o buffer ainda é insuficiente."""
+        # Um passo de treino a partir de um minibatch priorizado. 0.0 se o buffer ainda é insuficiente.
         if len(self.memory) < BATCH_SIZE:
             return 0.0
 
@@ -444,10 +420,10 @@ class Agent:
                 # Cada recomendação é um episódio fechado: o alvo é a própria recompensa.
                 target_q = rewards
             else:
-                # Double DQN (inativo em BANDIT_MODE, mantido como salvaguarda): a
-                # política escolhe a melhor ação, a target network a avalia. Separar
-                # quem escolhe de quem avalia elimina o viés de superestimação do
-                # max() do DQN padrão.
+                """Double DQN (inativo em BANDIT_MODE, mantido como salvaguarda): a
+                política escolhe a melhor ação, a target network a avalia. Separar
+                quem escolhe de quem avalia elimina o viés de superestimação do
+                max() do DQN padrão."""
                 target_q = self._double_dqn_target(next_states, rewards, dones)
 
         td_errors = (curr_q - target_q).detach().cpu().numpy()
@@ -521,17 +497,15 @@ class Agent:
         self.target_net.eval()
 
 
-# =====================================================================
-# Política de recomendação (antes em policy.py)
-# =====================================================================
-# Princípio de separação (importante): tudo nesta seção é pós-processamento. Fadiga,
-# softmax e MMR atuam depois que a rede calculou os Q-values, apenas na seleção do que
-# exibir. Nada aqui altera pesos, gradientes ou o que o modelo aprende — o treino
-# (Agent.replay()) continua enxergando os Q-values puros.
+# Política de recomendação
 
+"""Princípio de separação: tudo nesta seção é pós-processamento. Fadiga,
+softmax e MMR atuam depois que a rede calculou os Q-values, apenas na seleção do que
+exibir. Nada aqui altera pesos, gradientes ou o que o modelo aprende.
+O treino (Agent.replay()) continua enxergando os Q-values puros."""
 
 class FatigueTracker:
-    """Penaliza itens recomendados recentemente, para evitar repetição e monotonia."""
+    # Penaliza itens recomendados recentemente, para evitar repetição e monotonia.
 
     def __init__(self):
         self.last_seen: dict[int, int] = {}
@@ -575,7 +549,7 @@ def _minmax(values: np.ndarray) -> np.ndarray:
 
 
 class Recommender:
-    """Pipeline completo: elegibilidade -> guardrail -> pool -> score híbrido -> fadiga -> seleção."""
+    # Pipeline completo: elegibilidade -> guardrail -> pool -> score híbrido -> fadiga -> seleção.
 
     def __init__(self, df: pd.DataFrame, feature_space: FeatureSpace, agent: Agent):
         self.df = df
@@ -636,7 +610,7 @@ class Recommender:
     def _apply_safety_filter(self, eligible: np.ndarray, curr_oct: int) -> np.ndarray:
         """
         Guardrail de segurança: bloqueia itens de alta ativação para usuários em estados
-        de baixa energia. Regra dura, independente do que a DQN aprendeu — um DQN
+        de baixa energia. Regra dura, independente do que a DQN aprendeu. Um DQN
         otimiza apenas a recompensa recebida, sem noção de que recomendar atividade de
         alta ativação física a alguém em estado depressivo pode agravar o quadro.
         """
@@ -654,10 +628,7 @@ class Recommender:
     def _candidate_pool(self, eligible: np.ndarray, curr_oct: int, dest_oct: int):
         """
         Pool dos CANDIDATE_POOL_SIZE itens mais próximos do ponto-alvo, por distância
-        contínua no plano (V, A) — nunca por igualdade de oitante discreto. A coluna
-        Oitante só concorda 82% com o oitante geométrico nas fronteiras, e um filtro por
-        raio fixo pode retornar conjunto vazio (o oitante 5 não tem item em raio 0.7); o
-        ranking por distância sempre devolve os M mais próximos que existem.
+        contínua no plano (V, A), nao por igualdade de oitante discreto.
         """
         point = target_point(curr_oct, dest_oct, ISO_ALPHA)
         distances = distance_to_point(self.df.loc[eligible], point)
@@ -686,7 +657,7 @@ class Recommender:
 
         Retorna (posições no pool, tipo de cada slot, propensão de cada slot). A
         propensão é exata para os slots sorteados e 1.0 para os slots determinísticos
-        do MMR, condicionados aos sorteios anteriores — o campo slot_type permite que a
+        do MMR, condicionados aos sorteios anteriores. O campo slot_type permite que a
         análise off-policy futura (IPS/SNIPS/Doubly Robust) decida quais registros usar.
         """
         n = len(adjusted)
@@ -735,15 +706,12 @@ class Recommender:
         return chosen, slot_types, propensities
 
 
-# =====================================================================
-# Simulador de feedback (antes em simulator.py)
-# =====================================================================
-# BANCADA DE TESTE — NÃO FAZ PARTE DO CAMINHO DE PRODUÇÃO.
-#
-# Usado exclusivamente para testes offline, baselines e verificação do pipeline.
-# NUNCA deve ser usado para treinar o modelo que interage com usuários reais: treinar
-# e avaliar contra a mesma heurística faz o modelo apenas imitá-la, introduzindo viés
-# e circularidade metodológica.
+# Simulador de feedback - Bancada de teste
+
+"""Usado exclusivamente para testes offline, baselines e verificação do pipeline.
+NUNCA deve ser usado para treinar o modelo que interage com usuários reais: treinar
+e avaliar contra a mesma heurística faz o modelo apenas imitá-la, introduzindo viés
+e circularidade metodológica."""
 
 HIGH_ENERGY_OCTANTS = (3, 4)
 
@@ -818,21 +786,18 @@ def simulate_feedback_holdout(curr_oct: int, dest_oct: int, item: pd.Series) -> 
     return _simulate(curr_oct, dest_oct, item, bonus)
 
 
-# =====================================================================
-# Avaliação offline (antes em evaluation.py)
-# =====================================================================
-# BANCADA DE TESTE — NÃO FAZ PARTE DO CAMINHO DE PRODUÇÃO.
-#
-# Verificações offline: sanity checks estruturais, baselines contra o simulador holdout
-# e métricas de cobertura/diversidade. Usa o simulador apenas para gerar feedback
-# sintético em avaliação — nunca para treinar o modelo de produção (ver seção acima).
+# Avaliação offline - Bancada de teste
+
+"""Verificações offline: sanity checks estruturais, baselines contra o simulador holdout
+e métricas de cobertura/diversidade. Usa o simulador apenas para gerar feedback
+sintético em avaliação — nunca para treinar o modelo de produção (ver seção acima)."""
 
 CONTEXT_DURATIONS = (5, 15, 30, 60)
 
 
 def sanity_checks(recommender: Recommender, df: pd.DataFrame) -> None:
-    """Bateria de checagens estruturais sobre o pipeline de recomendação."""
-    print("=== Sanity checks ===")
+    # Bateria de checagens estruturais sobre o pipeline de recomendação.
+    print("- Sanity checks")
 
     # 1. Nenhuma recomendação excede o tempo disponível.
     violations = sum(
@@ -862,8 +827,7 @@ def sanity_checks(recommender: Recommender, df: pd.DataFrame) -> None:
             changed += other != base
     print(f"[3] Listas alteradas ao mudar o oitante atual: {changed}/{total}")
 
-    # 4. Guardrail bloqueia exatamente 22 itens para oitantes de baixa energia (valor
-    #    medido no dataset atual).
+    # 4. Guardrail bloqueia exatamente 22 itens para oitantes de baixa energia (valor medido no dataset atual).
     checked_before, blocked_before = recommender.safety_checked, recommender.safety_blocked
     recommender.recommend(5, 7, 120)
     checked = recommender.safety_checked - checked_before
@@ -938,7 +902,7 @@ def baselines(df: pd.DataFrame, feature_space: FeatureSpace, n_episodes: int = 1
     }
     rewards = {name: [] for name in policies}
 
-    print("=== Baselines (simulador holdout) ===")
+    print("- Baselines (simulador holdout)")
     for _ in range(n_episodes):
         curr, dest, time_avail = _random_context()
         elig = df.index[df["Duracao"] <= time_avail].to_numpy(dtype=int)
@@ -984,7 +948,7 @@ def coverage_and_diversity(recommender: Recommender, df: pd.DataFrame) -> None:
     avg_diversity = float(np.mean(diversities)) if diversities else float("nan")
     top_items = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
 
-    print("=== Cobertura e diversidade ===")
+    print("- Cobertura e diversidade")
     print(f"Cobertura de catálogo: {coverage:.3f}")
     print(f"Diversidade intra-lista média: {avg_diversity:.3f}")
     print("Itens mais recomendados:")
@@ -992,9 +956,7 @@ def coverage_and_diversity(recommender: Recommender, df: pd.DataFrame) -> None:
         print(f"  {df.loc[item_idx, 'Nome']}: {count}")
 
 
-# =====================================================================
-# CLI interativo e ponto de entrada (antes em app.py)
-# =====================================================================
+# CLI interativo e ponto de entrada
 
 def _print_octant_map() -> None:
     print("Mapa de oitantes:")
@@ -1151,7 +1113,7 @@ def main(dataset_path: str = None, carregar: str = None, salvar: str = CHECKPOIN
 
 
 def _run_offline_evaluation() -> None:
-    """Bancada de teste completa: sanity checks, cobertura/diversidade e baselines."""
+    # Bancada de teste completa: sanity checks, cobertura/diversidade e baselines.
     set_seed(SEED)
     df = load_dataset()
     feature_space = FeatureSpace(df)
@@ -1166,7 +1128,7 @@ def _run_offline_evaluation() -> None:
 
 
 if __name__ == "__main__":
-    # `python sistema_de_recomendacao_v2.py --eval` roda a bancada de teste offline
+    # python sistema_de_recomendacao_v2.py --eval roda a bancada de teste offline
     # (simulador + baselines) em vez do loop interativo de produção.
     if "--eval" in sys.argv:
         _run_offline_evaluation()

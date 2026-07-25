@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Sistema de Recomendação de Intervenções — v2 (arquivo único)
+Sistema de Recomendação de Intervenções — v3
 
 Este arquivo reúne, em um único módulo executável, as funcionalidades que no
 projeto vivem separadas em config.py, core.py, agent.py, policy.py,
@@ -17,8 +17,6 @@ simulator.py, evaluation.py e app.py:
     caminho de produção (nunca usados para treinar o modelo real)
   - CLI interativo e ponto de entrada
 
-Os módulos separados continuam existindo no projeto; este arquivo é uma
-consolidação para quem precisar de uma versão única e autocontida.
 """
 import json
 import os
