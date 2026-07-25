@@ -19,6 +19,7 @@ simulator.py, evaluation.py e app.py:
 
 """
 import json
+import math
 import os
 import random
 import sys
@@ -80,6 +81,50 @@ SAFETY_AROUSAL_THRESHOLD = 0.6   # itens acima disso são bloqueados nesses esta
 
 # ---------- Cold-start (mistura heurística -> DQN) ----------
 WARMUP_INTERACTIONS = 50    # nº de feedbacks reais até confiar 100% na DQN
+
+# ---------- Escala de recompensa / feedback (cabeça categórica) ----------
+# FEEDBACK_LEVELS é a única fonte de verdade: a rede (nº de saídas), o texto do CLI, o
+# log e o HL-Gauss se ajustam automaticamente a partir daqui — mudar a granularidade
+# (nº de níveis) não exige tocar em mais nada.
+FEEDBACK_LEVELS = {
+    1: "Muito ruim / piorou bastante",
+    2: "Ruim / não funcionou",
+    3: "Indiferente / ok / razoável",
+    4: "Bom / funcionou",
+    5: "Muito bom / muito eficaz",
+}
+N_REWARD_LEVELS = len(FEEDBACK_LEVELS)
+# Suporte fixo em [-1, 1]: a amplitude da recompensa não depende do nº de níveis, só a
+# granularidade — isso isola a perda, o clipping de gradiente e o PER de mudanças
+# futuras na escala de feedback.
+REWARD_SUPPORT = tuple(2.0 * i / (N_REWARD_LEVELS - 1) - 1.0 for i in range(N_REWARD_LEVELS))
+_REWARD_SUPPORT_ARR = np.array(REWARD_SUPPORT, dtype=np.float32)
+_BIN_WIDTH = REWARD_SUPPORT[1] - REWARD_SUPPORT[0]
+
+# HL-Gauss (histogram loss / regressão-como-classificação, Imani & White 2018;
+# Farebrother et al. 2024): projeta um alvo contínuo em uma distribuição suave sobre os
+# átomos de REWARD_SUPPORT, preservando a noção de ordinalidade entre categorias
+# vizinhas — em vez de tratar "muito ruim" e "muito bom" como classes independentes.
+HL_GAUSS_SIGMA = 0.75 * _BIN_WIDTH
+
+# ---------- Seleção sensível a risco / guardrail probabilístico ----------
+# Ambos a partir da distribuição categórica aprendida (ver Recommender._hybrid_score /
+# _apply_probabilistic_guardrail).
+RISK_AVERSION_LAMBDA = 0.3       # peso da penalidade por P(muito ruim) no score híbrido
+USE_PROBABILISTIC_GUARDRAIL = True
+PROB_GUARDRAIL_THRESHOLD = 0.5   # bloqueia item se P(muito ruim)+P(ruim) > isso, pós-warmup
+
+# Simulador: recompensa latente contínua é comprimida por este fator antes de ser
+# quantizada no nível mais próximo, para emular o viés de "evitar os extremos" que
+# usuários reais tendem a ter em escalas Likert.
+CENTRAL_BIAS_FACTOR = 0.85
+
+
+def feedback_level_to_reward(level: int) -> float:
+    """Mapeia o nível ordinal (1..N_REWARD_LEVELS) escolhido pelo usuário para o valor
+    contínuo correspondente em REWARD_SUPPORT."""
+    return REWARD_SUPPORT[level - 1]
+
 
 # ---------- Anti-monotonia ----------
 SOFTMAX_TEMPERATURE = 0.3   # temperatura do sorteio do slot 1 (menor = mais guloso)
@@ -294,14 +339,17 @@ Transition = namedtuple(
 
 class ContentAwareDQN(nn.Module):
     """
-    Recebe a concatenação [estado_do_usuário || features_do_item] e devolve um único
-    Q-value para esse par — não há uma saída por ação como no DQN clássico. Para
-    recomendar, calcula-se Q para todos os itens candidatos e ranqueia-se.
+    Recebe a concatenação [estado_do_usuário || features_do_item] e devolve os logits de
+    uma distribuição categórica sobre REWARD_SUPPORT (cabeça categórica / distributional
+    RL) — não um único Q-value de regressão. Ranquear itens usa o valor esperado dessa
+    distribuição (Agent.q_values); a distribuição completa (Agent.q_distribution) fica
+    disponível para diagnóstico de polarização e seleção sensível a risco.
     """
 
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, n_atoms: int = N_REWARD_LEVELS):
         super().__init__()
         h1, h2, h3 = HIDDEN_DIMS
+        self.n_atoms = n_atoms
         self.net = nn.Sequential(
             nn.Linear(input_dim, h1),
             # LayerNorm, não BatchNorm1d: normaliza por amostra, é indiferente ao
@@ -314,7 +362,7 @@ class ContentAwareDQN(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(h2, h3),
             nn.ReLU(inplace=True),
-            nn.Linear(h3, 1),
+            nn.Linear(h3, n_atoms),
         )
         self._init_weights()
 
@@ -396,21 +444,38 @@ class Agent:
         self.optimizer = torch.optim.Adam(
             self.policy_net.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
         )
-        # reduction="none" é obrigatório: cada perda precisa ser ponderada pelo peso de
-        # importance sampling do PER antes de ser mediada.
-        self.loss_fn = nn.SmoothL1Loss(reduction="none")
+        # Suporte fixo da distribuição categórica (ver REWARD_SUPPORT) e bordas dos bins
+        # usadas pelo HL-Gauss para projetar um alvo contínuo em rótulo suave.
+        self.support = torch.tensor(REWARD_SUPPORT, dtype=torch.float32, device=self.device)
+        self.support_np = _REWARD_SUPPORT_ARR.copy()
+        edges = np.concatenate([
+            [REWARD_SUPPORT[0] - _BIN_WIDTH / 2.0],
+            (self.support_np[:-1] + self.support_np[1:]) / 2.0,
+            [REWARD_SUPPORT[-1] + _BIN_WIDTH / 2.0],
+        ])
+        self.atom_edges = torch.tensor(edges, dtype=torch.float32, device=self.device)
         self.memory = PrioritizedReplayBuffer()
         self.n_feedbacks = 0
         self.history = {"loss": [], "reward": []}
 
-    @torch.no_grad()
-    def q_values(self, user_state: np.ndarray, item_indices: np.ndarray) -> np.ndarray:
-        """Q-value da rede de política para cada item candidato, dado o estado do usuário."""
-        self.policy_net.eval()
+    def _build_input(self, user_state: np.ndarray, item_indices: np.ndarray) -> torch.Tensor:
         user_repeat = np.repeat(user_state.reshape(1, -1), len(item_indices), axis=0)
         item_feats = self.feature_space.item_features(item_indices)
-        x = torch.from_numpy(np.concatenate([user_repeat, item_feats], axis=1)).to(self.device)
-        return self.policy_net(x).squeeze(-1).cpu().numpy()
+        return torch.from_numpy(np.concatenate([user_repeat, item_feats], axis=1)).to(self.device)
+
+    @torch.no_grad()
+    def q_distribution(self, user_state: np.ndarray, item_indices: np.ndarray) -> np.ndarray:
+        """P(nível) para cada item candidato, dado o estado do usuário — distribuição
+        categórica completa sobre REWARD_SUPPORT, usada por Recommender para
+        diagnóstico de polarização e seleção sensível a risco."""
+        self.policy_net.eval()
+        logits = self.policy_net(self._build_input(user_state, item_indices))
+        return torch.softmax(logits, dim=-1).cpu().numpy()
+
+    def q_values(self, user_state: np.ndarray, item_indices: np.ndarray) -> np.ndarray:
+        """Valor esperado da distribuição categórica: E[reward] = Σ pᵢ·valorᵢ, usado para ranquear."""
+        probs = self.q_distribution(user_state, item_indices)
+        return (probs * self.support_np).sum(axis=1)
 
     def store(self, user_state: np.ndarray, item_idx: int, reward: float,
               next_user_state: np.ndarray, done: bool = True) -> None:
@@ -419,6 +484,24 @@ class Agent:
             done = True
         item_features = self.feature_space.item_features(np.array([item_idx]))[0]
         self.memory.push(Transition(user_state, item_features, reward, next_user_state, done))
+
+    def _hl_gauss_target(self, rewards: torch.Tensor) -> torch.Tensor:
+        """Projeta recompensas (contínuas, no caso do simulador, ou já exatamente sobre
+        um átomo, no caso de feedback real) em rótulos suaves sobre REWARD_SUPPORT —
+        histograma gaussiano (HL-Gauss), que preserva a ordinalidade entre níveis
+        vizinhos em vez de tratá-los como classes independentes."""
+        y = rewards.clamp(self.support[0], self.support[-1]).unsqueeze(1)
+        z = torch.erf((self.atom_edges.unsqueeze(0) - y) / (HL_GAUSS_SIGMA * math.sqrt(2.0)))
+        cdf = 0.5 * (1.0 + z)
+        probs = (cdf[:, 1:] - cdf[:, :-1]).clamp_min(1e-8)
+        return probs / probs.sum(dim=1, keepdim=True)
+
+    @staticmethod
+    def _soft_ce_loss(logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
+        # Entropia cruzada com rótulo suave, reduction="none" (ponderação por IS weight
+        # do PER acontece depois, em replay()).
+        log_probs = torch.log_softmax(logits, dim=-1)
+        return -(target_probs * log_probs).sum(dim=-1)
 
     def replay(self) -> float:
         """Um passo de treino a partir de um minibatch priorizado. 0.0 se o buffer ainda é insuficiente."""
@@ -435,21 +518,24 @@ class Agent:
         next_states = torch.from_numpy(np.stack(batch.next_user_state)).to(self.device)
         is_weights = torch.from_numpy(is_weights).to(self.device)
 
-        curr_q = self.policy_net(torch.cat([user_states, item_feats], dim=1)).squeeze(-1)
+        logits = self.policy_net(torch.cat([user_states, item_feats], dim=1))
+        with torch.no_grad():
+            curr_q = (torch.softmax(logits, dim=-1) * self.support).sum(dim=-1)
 
         with torch.no_grad():
             if BANDIT_MODE:
                 # Cada recomendação é um episódio fechado: o alvo é a própria recompensa.
                 target_q = rewards
+                target_probs = self._hl_gauss_target(rewards)
             else:
                 # Double DQN (inativo em BANDIT_MODE, mantido como salvaguarda): a
                 # política escolhe a melhor ação, a target network a avalia. Separar
                 # quem escolhe de quem avalia elimina o viés de superestimação do
                 # max() do DQN padrão.
-                target_q = self._double_dqn_target(next_states, rewards, dones)
+                target_probs, target_q = self._double_dqn_target(next_states, rewards, dones)
 
         td_errors = (curr_q - target_q).detach().cpu().numpy()
-        loss = (self.loss_fn(curr_q, target_q) * is_weights).mean()
+        loss = (self._soft_ce_loss(logits, target_probs) * is_weights).mean()
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -463,7 +549,12 @@ class Agent:
         return float(loss.item())
 
     def _double_dqn_target(self, next_states: torch.Tensor, rewards: torch.Tensor,
-                            dones: torch.Tensor) -> torch.Tensor:
+                            dones: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Double DQN categórico simplificado: usa o valor esperado (não a projeção C51
+        completa da distribuição) da target network no próximo estado como alvo de
+        Bellman, e reprojeta esse escalar em REWARD_SUPPORT via HL-Gauss. Suficiente
+        para um caminho que só existe como salvaguarda e nunca é exercitado em produção
+        (BANDIT_MODE=True)."""
         n_items = self.feature_space.item_matrix.shape[0]
         batch_size = next_states.shape[0]
         all_items = torch.from_numpy(self.feature_space.item_matrix).to(self.device)
@@ -472,12 +563,16 @@ class Agent:
         expanded_items = all_items.unsqueeze(0).expand(batch_size, n_items, -1)
         candidates = torch.cat([expanded_states, expanded_items], dim=2).reshape(batch_size * n_items, -1)
 
-        policy_q = self.policy_net(candidates).view(batch_size, n_items)
+        policy_logits = self.policy_net(candidates).view(batch_size, n_items, -1)
+        policy_q = (torch.softmax(policy_logits, dim=-1) * self.support).sum(dim=-1)
         best_actions = policy_q.argmax(dim=1)
 
         best_item_feats = all_items[best_actions]
-        next_q = self.target_net(torch.cat([next_states, best_item_feats], dim=1)).squeeze(-1)
-        return rewards + GAMMA * next_q * (1.0 - dones)
+        next_logits = self.target_net(torch.cat([next_states, best_item_feats], dim=1))
+        next_q = (torch.softmax(next_logits, dim=-1) * self.support).sum(dim=-1)
+
+        target_q = rewards + GAMMA * next_q * (1.0 - dones)
+        return self._hl_gauss_target(target_q), target_q
 
     def _soft_update_target(self) -> None:
         """Soft update (Polyak): evita o 'alvo móvel' sem a descontinuidade de cópias periódicas abruptas."""
@@ -511,8 +606,16 @@ class Agent:
         data = torch.load(path, map_location=self.device, weights_only=False)
         feature_space.assert_compatible(data["feature_signature"])
         self.feature_space = feature_space
-        self.policy_net.load_state_dict(data["policy_state"])
-        self.target_net.load_state_dict(data["target_state"])
+        try:
+            self.policy_net.load_state_dict(data["policy_state"])
+            self.target_net.load_state_dict(data["target_state"])
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Checkpoint '{path}' incompatível: foi salvo com a cabeça de regressão "
+                "antiga (saída Linear(*, 1)), antes da migração para a cabeça categórica "
+                f"(saída Linear(*, {N_REWARD_LEVELS})). Apague ou renomeie o checkpoint "
+                "para treinar um agente do zero com a arquitetura atual."
+            ) from exc
         self.optimizer.load_state_dict(data["optimizer_state"])
         self.n_feedbacks = int(data.get("n_feedbacks", 0))
         self.history = data.get("history", {"loss": [], "reward": []})
@@ -601,9 +704,19 @@ class Recommender:
         pool_idx, pool_dist = self._candidate_pool(eligible, curr_oct, dest_oct)
 
         user_state = self.feature_space.user_state(curr_oct, dest_oct, time_avail)
-        q_values = self.agent.q_values(user_state, pool_idx)
-        score = self._hybrid_score(pool_dist, q_values)
+        q_dist = self.agent.q_distribution(user_state, pool_idx)
+        q_values = (q_dist * self.agent.support_np).sum(axis=1)
+
+        pool_idx, pool_dist, q_dist, q_values = self._apply_probabilistic_guardrail(
+            pool_idx, pool_dist, q_dist, q_values
+        )
+
+        score = self._hybrid_score(pool_dist, q_values, q_dist)
         adjusted = score - self.fatigue.penalty(pool_idx)
+
+        # Desvio padrão da distribuição categórica: proxy de polarização — uma média
+        # "ok" com desvio alto sinaliza opiniões divididas (bimodal), não indiferença.
+        reward_std = np.sqrt((q_dist * (self.agent.support_np - q_values[:, None]) ** 2).sum(axis=1))
 
         pool_vectors = self.feature_space.item_features(pool_idx)
         positions, slot_types, propensities = self._select_slots(adjusted, pool_vectors, k)
@@ -621,8 +734,10 @@ class Recommender:
                 "valencia": float(row["Valencia"]),
                 "arousal": float(row["Arousal"]),
                 "indoor": int(row["Indoor"]),
-                "q_value": float(q_values[pos]),        # Q bruto da rede (diagnóstico)
-                "score": float(adjusted[pos]),           # score híbrido pós-fadiga
+                "q_value": float(q_values[pos]),         # E[reward] da distribuição categórica (diagnóstico)
+                "reward_std": float(reward_std[pos]),    # dispersão da distribuição (proxy de polarização)
+                "p_muito_ruim": float(q_dist[pos, 0]),   # P(nível 1 = muito ruim), usado no guardrail probabilístico
+                "score": float(adjusted[pos]),           # score híbrido pós-fadiga e pós-risco
                 "propensity": propensity,                # π(a|x) para avaliação off-policy
                 "slot_type": slot_type,                  # "softmax" | "explore" | "mmr"
             })
@@ -662,17 +777,45 @@ class Recommender:
         order = np.argsort(distances)[:CANDIDATE_POOL_SIZE]
         return eligible[order], distances[order]
 
-    def _hybrid_score(self, pool_dist: np.ndarray, q_values: np.ndarray) -> np.ndarray:
+    def _apply_probabilistic_guardrail(
+        self, pool_idx: np.ndarray, pool_dist: np.ndarray, q_dist: np.ndarray, q_values: np.ndarray
+    ):
+        """
+        Guardrail reativo baseado na distribuição categórica aprendida pelo DQN — complementa
+        o guardrail estático de V-A (_apply_safety_filter), que só conhece geometria, não
+        histórico de feedback. Bloqueia itens com P(muito ruim)+P(ruim) alta.
+
+        Só atua pós-WARMUP_INTERACTIONS: antes disso a rede está com pesos praticamente
+        aleatórios e suas probabilidades não significam nada — bloquear com base nelas
+        seria ruído, não segurança. Nunca esvazia o pool (mesmo princípio do guardrail estático).
+        """
+        if not USE_PROBABILISTIC_GUARDRAIL or self.agent.n_feedbacks < WARMUP_INTERACTIONS:
+            return pool_idx, pool_dist, q_dist, q_values
+
+        p_negative = q_dist[:, 0] + q_dist[:, 1]  # P(muito ruim) + P(ruim)
+        safe = p_negative <= PROB_GUARDRAIL_THRESHOLD
+        if not safe.any():
+            return pool_idx, pool_dist, q_dist, q_values
+        return pool_idx[safe], pool_dist[safe], q_dist[safe], q_values[safe]
+
+    def _hybrid_score(self, pool_dist: np.ndarray, q_values: np.ndarray, q_dist: np.ndarray) -> np.ndarray:
         """
         Mistura heurística de proximidade afetiva com a DQN. Enquanto a rede está fria
         (poucos feedbacks) quem governa é a heurística, segura e interpretável; conforme
         feedback real se acumula, o peso migra para a DQN. Em WARMUP_INTERACTIONS
         feedbacks, a rede assume integralmente.
+
+        Seleção sensível a risco: subtrai uma penalidade proporcional a P(muito ruim),
+        também escalada por w — a mesma razão do warmup se aplica aqui: cedo demais, a
+        probabilidade de "muito ruim" estimada pela rede não é confiável o bastante para
+        pesar na escolha.
         """
         heuristic = 1.0 - _minmax(pool_dist)
         q_norm = _minmax(q_values)
         w = min(1.0, self.agent.n_feedbacks / WARMUP_INTERACTIONS)
-        return (1.0 - w) * heuristic + w * q_norm
+        base = (1.0 - w) * heuristic + w * q_norm
+        risk_penalty = RISK_AVERSION_LAMBDA * w * q_dist[:, 0]
+        return base - risk_penalty
 
     def _select_slots(self, adjusted: np.ndarray, pool_vectors: np.ndarray, k: int):
         """
@@ -761,7 +904,7 @@ def _simulate(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> tuple[
             p_execution -= 0.2
     p_execution = max(0.05, p_execution)
     if random.random() > p_execution:
-        return -0.5, curr_oct
+        return REWARD_SUPPORT[1], curr_oct   # equivalente a "ruim": não chegou a executar a intervenção
 
     # Alinhamento entre a mudança desejada (dest - curr) e o vetor (V, A) do item.
     delta_target = np.array([dest_v - curr_v, dest_a - curr_a])
@@ -773,9 +916,16 @@ def _simulate(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> tuple[
     score += bonus_fn(curr_oct, item)
     score += random.gauss(0, 0.05)
     score = max(0.0, min(1.0, score))
-
-    reward = -1.0 + 3.0 * score   # contínuo em [-1, 2], preserva granularidade
     next_oct = dest_oct if score > 0.65 else curr_oct
+
+    # Recompensa latente contínua em [-1, 1] (score=0 -> -1, score=0.5 -> 0, score=1 ->
+    # 1), comprimida por CENTRAL_BIAS_FACTOR para emular a relutância de usuários reais
+    # em marcar os extremos de uma escala Likert, e então quantizada no nível de
+    # REWARD_SUPPORT mais próximo — o simulador emite o mesmo formato discreto que o
+    # feedback real, não um valor contínuo que a rede nunca veria em produção.
+    latent_reward = (2.0 * score - 1.0) * CENTRAL_BIAS_FACTOR
+    level_idx = int(np.argmin(np.abs(_REWARD_SUPPORT_ARR - latent_reward)))
+    reward = REWARD_SUPPORT[level_idx]
     return reward, next_oct
 
 
@@ -902,7 +1052,7 @@ def _random_context():
     return curr, dest, time_avail
 
 
-def baselines(df: pd.DataFrame, feature_space: FeatureSpace, n_episodes: int = 1000) -> None:
+def baselines(df: pd.DataFrame, feature_space: FeatureSpace, n_episodes: int = 1000) -> Agent:
     """
     Compara: Aleatório; Mais popular (maior valência); Conteúdo puro (mais próximo do
     ponto-alvo, sem aprendizado); e um Agent aprendendo online — todos avaliados contra
@@ -910,7 +1060,8 @@ def baselines(df: pd.DataFrame, feature_space: FeatureSpace, n_episodes: int = 1
     recompensa média com intervalo de confiança por bootstrap.
 
     Um sistema neural que não supera "conteúdo puro" não está agregando valor — este é
-    o baseline crítico.
+    o baseline crítico. Retorna o Agent treinado (agent_online) para reaproveitamento em
+    calibration_check, evitando treinar um segundo agente do zero só para isso.
     """
     agent = Agent(df, feature_space)
 
@@ -956,6 +1107,8 @@ def baselines(df: pd.DataFrame, feature_space: FeatureSpace, n_episodes: int = 1
         mean, lo, hi = _bootstrap_ci(np.array(values))
         print(f"  {name:16s} recompensa média = {mean:+.3f}  IC95%=[{lo:+.3f}, {hi:+.3f}]  (n={len(values)})")
 
+    return agent
+
 
 def coverage_and_diversity(recommender: Recommender, df: pd.DataFrame) -> None:
     """Sobre a grade de contextos: cobertura de catálogo, diversidade intra-lista média
@@ -988,6 +1141,73 @@ def coverage_and_diversity(recommender: Recommender, df: pd.DataFrame) -> None:
     print("Itens mais recomendados:")
     for item_idx, count in top_items:
         print(f"  {df.loc[item_idx, 'Nome']}: {count}")
+
+
+def feedback_scale_usage(df: pd.DataFrame, n_samples: int = 2000) -> None:
+    """
+    Verifica se o simulador holdout (proxy do usuário real) de fato espalha o feedback
+    pelos N_REWARD_LEVELS níveis, ou se aglomera no "indiferente" — se aglomerar, a
+    cabeça categórica nunca verá sinal suficiente para diferenciar os extremos, por
+    melhor que seja a arquitetura.
+    """
+    counts = {level: 0 for level in FEEDBACK_LEVELS}
+    for _ in range(n_samples):
+        curr, dest, time_avail = _random_context()
+        elig = df.index[df["Duracao"] <= time_avail].to_numpy(dtype=int)
+        if len(elig) == 0:
+            continue
+        item_idx = int(np.random.choice(elig))
+        reward, _ = simulate_feedback_holdout(curr, dest, df.loc[item_idx])
+        level = REWARD_SUPPORT.index(reward) + 1
+        counts[level] += 1
+
+    total = sum(counts.values())
+    print("=== Uso da escala de feedback (simulador holdout) ===")
+    for level, label in FEEDBACK_LEVELS.items():
+        frac = counts[level] / total if total else 0.0
+        print(f"  [{level}] {label:32s} {counts[level]:5d}  ({frac:.1%})")
+
+
+def calibration_check(agent: Agent, df: pd.DataFrame, feature_space: FeatureSpace,
+                       n_samples: int = 3000) -> None:
+    """
+    Mede se as probabilidades emitidas pela cabeça categórica são calibradas: para o
+    nível previsto como mais provável, compara a confiança média da rede com a
+    frequência empírica de acerto no simulador holdout (nunca no principal, para não
+    medir imitação em vez de generalização). Erro de calibração (ECE) baixo indica que
+    P(nível) é utilizável para seleção sensível a risco, não só para ranquear por E[reward].
+    """
+    confidences, hits = [], []
+    for _ in range(n_samples):
+        curr, dest, time_avail = _random_context()
+        elig = df.index[df["Duracao"] <= time_avail].to_numpy(dtype=int)
+        if len(elig) == 0:
+            continue
+        item_idx = int(np.random.choice(elig))
+        user_state = feature_space.user_state(curr, dest, time_avail)
+        probs = agent.q_distribution(user_state, np.array([item_idx]))[0]
+        predicted_level = int(np.argmax(probs))
+        confidences.append(float(probs[predicted_level]))
+
+        reward, _ = simulate_feedback_holdout(curr, dest, df.loc[item_idx])
+        actual_level = REWARD_SUPPORT.index(reward)
+        hits.append(actual_level == predicted_level)
+
+    confidences = np.array(confidences)
+    hits = np.array(hits, dtype=np.float32)
+
+    bins = np.linspace(0.0, 1.0, 11)
+    ece = 0.0
+    print("=== Calibração da cabeça categórica (simulador holdout) ===")
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (confidences >= lo) & (confidences < hi)
+        if not mask.any():
+            continue
+        bin_conf = confidences[mask].mean()
+        bin_acc = hits[mask].mean()
+        ece += (mask.sum() / len(confidences)) * abs(bin_conf - bin_acc)
+        print(f"  confiança∈[{lo:.1f},{hi:.1f}) n={mask.sum():4d}  conf.média={bin_conf:.3f}  acerto={bin_acc:.3f}")
+    print(f"  Erro de calibração esperado (ECE) = {ece:.3f}")
 
 
 # =====================================================================
@@ -1031,18 +1251,23 @@ def _read_choice(prompt: str, options: list[str]) -> str:
         print(f"Escolha inválida. Use uma das opções: {', '.join(options)}.")
 
 
-def _read_feedback() -> float:
-    levels = {"1": -1.0, "2": 0.0, "3": 1.0, "4": 2.0}
+def _read_feedback() -> tuple[int, float]:
+    """
+    Escala Likert de N_REWARD_LEVELS níveis (ver FEEDBACK_LEVELS/REWARD_SUPPORT no
+    topo do arquivo). Retorna (nível ordinal 1..N, recompensa mapeada em REWARD_SUPPORT)
+    — o nível ordinal é persistido separadamente da recompensa numérica no log de
+    interação (ver _persist_interaction), para sobreviver a qualquer remapeamento
+    futuro da escala.
+    """
     print("Feedback:")
-    print("  [1] Não gostei / não funcionou")
-    print("  [2] Indiferente / parcial")
-    print("  [3] Gostei / funcionou")
-    print("  [4] Gostei muito / muito eficaz")
+    for level, label in FEEDBACK_LEVELS.items():
+        print(f"  [{level}] {label}")
     while True:
         value = input("Sua avaliação: ").strip()
-        if value in levels:
-            return levels[value]
-        print("Feedback inválido. Escolha 1, 2, 3 ou 4.")
+        if value.isdigit() and int(value) in FEEDBACK_LEVELS:
+            level = int(value)
+            return level, feedback_level_to_reward(level)
+        print(f"Feedback inválido. Escolha um valor entre 1 e {len(FEEDBACK_LEVELS)}.")
 
 
 def _persist_interaction(record: dict, path: str = INTERACTION_LOG_PATH) -> None:
@@ -1073,9 +1298,10 @@ def _run_interaction(recommender: Recommender, agent: Agent, feature_space: Feat
         print(
             f"  [{label}] {item['nome']} | {item['tipo']} | {item['tag']} | {item['duracao']} min | "
             f"V={item['valencia']:.2f} | A={item['arousal']:.2f} | indoor={item['indoor']} | "
-            f"Q={item['q_value']:.3f} | π={item['propensity']:.4f}"
+            f"Q={item['q_value']:.3f} | σ={item['reward_std']:.3f} | P(muito ruim)={item['p_muito_ruim']:.3f} | "
+            f"π={item['propensity']:.4f}"
         )
-    print("  [0] Nenhuma das opções")
+    print("  [0] Não executei nenhuma intervenção")
 
     try:
         choice = _read_choice("Escolha uma opção: ", labels + ["0"])
@@ -1083,12 +1309,12 @@ def _run_interaction(recommender: Recommender, agent: Agent, feature_space: Feat
         return False
 
     if choice == "0":
-        print("Nenhuma intervenção selecionada. Sem aprendizado para esta rodada.\n")
+        print("Nenhuma intervenção executada. Sem aprendizado para esta rodada.\n")
         return True
 
     item = recommendations[labels.index(choice)]
     try:
-        reward = _read_feedback()
+        feedback_level, reward = _read_feedback()
     except KeyboardInterrupt:
         return False
 
@@ -1103,10 +1329,13 @@ def _run_interaction(recommender: Recommender, agent: Agent, feature_space: Feat
         "dest_oct": dest_oct,
         "time_avail": time_avail,
         "item_idx": item["item_idx"],
+        "feedback_level": feedback_level,
         "reward": reward,
         "propensity": item["propensity"],
         "slot_type": item["slot_type"],
         "q_value": item["q_value"],
+        "reward_std": item["reward_std"],
+        "p_muito_ruim": item["p_muito_ruim"],
         "score": item["score"],
         "n_feedbacks": agent.n_feedbacks,
     })
@@ -1149,7 +1378,8 @@ def main(dataset_path: str = None, carregar: str = None, salvar: str = CHECKPOIN
 
 
 def _run_offline_evaluation() -> None:
-    """Bancada de teste completa: sanity checks, cobertura/diversidade e baselines."""
+    """Bancada de teste completa: sanity checks, cobertura/diversidade, baselines,
+    uso da escala de feedback e calibração da cabeça categórica."""
     set_seed(SEED)
     df = load_dataset()
     feature_space = FeatureSpace(df)
@@ -1160,7 +1390,15 @@ def _run_offline_evaluation() -> None:
     print()
     coverage_and_diversity(recommender, df)
     print()
-    baselines(df, feature_space, n_episodes=1000)
+    feedback_scale_usage(df)
+    print()
+    # n_episodes=3000: a cabeça categórica (entropia cruzada com rótulo suave) converge
+    # mais devagar que a antiga regressão (SmoothL1) no mesmo learning rate — com 1000
+    # episódios ainda não supera "conteúdo puro" de forma consistente; 3000 dá margem
+    # confortável (ver nota de migração: baseline crítico do projeto).
+    trained_agent = baselines(df, feature_space, n_episodes=3000)
+    print()
+    calibration_check(trained_agent, df, feature_space)
 
 
 if __name__ == "__main__":
