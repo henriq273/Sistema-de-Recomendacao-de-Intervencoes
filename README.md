@@ -4,13 +4,13 @@ Projeto de iniciação científica para o desenvolvimento de um sistema de recom
 ## Visão geral do pipeline
 
 ```
-fonte de dados (CSV ou Mongo)
+fonte de dados (CSV | export JSON local em dbs/ | Mongo ao vivo)
         │
         ▼
 carga + normalização (load_active_catalog)
         │
         ▼
-curadoria de segurança (safety.py) ── só quando o backend é Mongo
+curadoria de segurança (safety.py) ── backends json_export e mongo
         │
         ▼
 FeatureSpace + Agent (DQN categórico) + Recommender
@@ -21,14 +21,16 @@ CLI interativo (main)  |  bancada de teste offline (--eval)
 
 Todo o núcleo do sistema (config, features, agente, política de recomendação, CLI) vive
 em `sistema_de_recomendacao_v3.py`. Os módulos `data_source.py`, `safety.py` e
-`normalization.py` são companheiros, usados quando a fonte de dados é um MongoDB real
-em vez do `dataset.csv` sintético.
+`normalization.py` são companheiros, usados quando a fonte de dados é um catálogo real
+(export JSON local ou MongoDB ao vivo) em vez do `dataset.csv` sintético.
 
 ## Requisitos
 
 - Python 3.10+
 - `numpy`, `pandas`, `torch` (núcleo do sistema)
-- `pymongo` (só necessário se `DATA_BACKEND = "mongo"`)
+- `pymongo` (só necessário se `DATA_BACKEND = "mongo"` — **não** é necessário para
+  `"csv"` nem para `"json_export"`; o import de `pymongo` em `data_source.py` é local à
+  função que de fato conecta no banco)
 
 ```bash
 python -m venv .venv
@@ -47,26 +49,54 @@ A fonte de dados é escolhida pela constante `DATA_BACKEND` no topo de
   valor de `DATA_BACKEND` — a bancada pressupõe esse dataset sintético específico
   (ex.: o sanity check de guardrail espera bloquear exatamente 22/100 itens).
 
-- **`"mongo"`** — lê um catálogo real via `data_source.load_catalog()`, com documentos
-  multimodais (vídeo/áudio/imagem) vindos de datasets afetivos públicos (DEAM, MuVi,
-  OASIS, EmoMadrid, GAPED, EMOPIA). **O sistema nunca escreve no banco**: toda leitura é
-  via `find()`/`aggregate()` somente leitura; não há nenhuma chamada de
-  `update`/`insert`/`delete` em nenhum módulo (verificado automaticamente, ver seção 3).
+- **`"json_export"`** — lê um catálogo real a partir de arquivos locais gerados por
+  `mongoexport --jsonArray`, um por modalidade, **sem depender de conexão viva nem de
+  `pymongo` instalado**. Backend pensado para testar a normalização/curadoria contra
+  dados reais offline, antes de (ou sem) ter acesso ao Mongo ao vivo.
+
+  **Diretório de referência: `dbs/`, na raiz do projeto.** É o único lugar
+  pesquisado — os arquivos precisam se chamar exatamente `videos.json`, `audios.json`
+  e `images.json` dentro dessa pasta (`sysrec.JSON_EXPORT_DIR` /
+  `sysrec.JSON_EXPORT_PATHS`, em `sistema_de_recomendacao_v3.py`). Modalidade cujo
+  arquivo ainda não existir é pulada com aviso, sem bloquear as demais — dá para testar
+  hoje só com `dbs/videos.json`, antes de `audios.json`/`images.json` existirem:
+
+  ```bash
+  mongoexport --uri "<mongo-uri>" --collection videos --jsonArray --out dbs/videos.json
+  mongoexport --uri "<mongo-uri>" --collection audios --jsonArray --out dbs/audios.json
+  mongoexport --uri "<mongo-uri>" --collection images --jsonArray --out dbs/images.json
+  ```
+
+  ```python
+  DATA_BACKEND = "json_export"
+  ```
+
+- **`"mongo"`** — lê o catálogo real ao vivo via `data_source.load_catalog()`, com
+  documentos multimodais (vídeo/áudio/imagem) vindos de datasets afetivos públicos
+  (DEAM, MuVi, OASIS, EmoMadrid, GAPED, EMOPIA), uma coleção por modalidade. **O
+  sistema nunca escreve no banco**: toda leitura é via `find()` somente leitura; não há
+  nenhuma chamada de `update`/`insert`/`delete` em nenhum módulo (verificado
+  automaticamente, ver seção 3).
 
   Antes de trocar para `"mongo"`, ajustar em `sistema_de_recomendacao_v3.py`:
   ```python
   DATA_BACKEND = "mongo"
   MONGO_URI = "mongodb://<host>/<db>?readPreference=secondary"  # idealmente um usuário read-only
   MONGO_DB = "nome_do_banco"
-  MONGO_COLLECTION = "interventions"
+  MONGO_COLLECTIONS = {"video": "videos", "audio": "audios", "image": "images"}
   ```
 
-  `load_catalog()` normaliza cada documento (por modalidade) para o mesmo esquema de
-  colunas que `FeatureSpace` já espera (`Nome`, `Tipo`, `Valencia`, `Arousal`,
-  `Duracao`, `Indoor`, `Tag`, `Oitante`) — é um substituto direto de `load_dataset()`,
-  sem tocar em `FeatureSpace`/`Agent`/`Recommender`. Documentos com modalidade
-  desconhecida ou sem valência/arousal resolvível são descartados e contados por
-  motivo, nunca incluídos com valor nulo ou inventado.
+  Tanto `load_catalog()` (mongo) quanto `load_from_json_export()` (json_export)
+  normalizam cada documento (por modalidade, via `normalize_video_doc` /
+  `normalize_audio_doc` / `normalize_image_doc`) para o mesmo esquema de colunas que
+  `FeatureSpace` já espera (`Nome`, `Tipo`, `Valencia`, `Arousal`, `Duracao`, `Indoor`,
+  `Tag`, `Oitante`) — substitutos diretos de `load_dataset()`, sem tocar em
+  `FeatureSpace`/`Agent`/`Recommender`. Documentos sem valência/arousal resolvível são
+  descartados e contados por motivo, nunca incluídos com valor nulo ou inventado. Os
+  dois backends compartilham o mesmo núcleo de normalização/curadoria — a única
+  diferença é de onde os documentos brutos vêm (`data_source.iter_raw_docs()` é o
+  ponto único de acesso a documentos brutos, usado também por `normalization.py` e
+  `safety.py`, o que os torna agnósticos de qual dos dois backends está ativo).
 
   Ponto único de carga (dá para chamar diretamente, sem se preocupar com o backend):
   ```python
@@ -74,11 +104,11 @@ A fonte de dados é escolhida pela constante `DATA_BACKEND` no topo de
   df = load_active_catalog()
   ```
 
-## 2. Limpar / curar os dados (backend Mongo)
+## 2. Limpar / curar os dados (backends json_export e mongo)
 
 Curadoria de segurança em `safety.py`, **100% em memória, nunca escreve no banco** —
-chamada automaticamente por `data_source.load_catalog()`. Quatro camadas, aplicadas
-nessa ordem:
+chamada automaticamente por `data_source.load_catalog()`/`load_from_json_export()`.
+Quatro camadas, aplicadas nessa ordem:
 
 1. **Allowlist de categoria** — só entram itens de `(dataset, category)` explicitamente
    aprovados em `APPROVED_CATEGORIES` (em `sistema_de_recomendacao_v3.py`). Começa
@@ -92,15 +122,19 @@ nessa ordem:
 4. **Bloqueio individual por ID** — `BLOCKED_ITEM_IDS`, sempre aplicado por último,
    nunca sobrescrito pelas camadas anteriores.
 
-Antes de popular `APPROVED_CATEGORIES`, levantar a taxonomia real do banco (consulta
-só leitura, salvar a saída localmente para revisão manual):
+Antes de popular `APPROVED_CATEGORIES`, levantar a taxonomia real do backend ativo
+(`DATA_BACKEND`, seção 1) — consulta só leitura, salvar a saída localmente para
+revisão manual:
 
 ```python
-from data_source import get_read_only_client
 from safety import explore_taxonomy
 
-resultado = explore_taxonomy(get_read_only_client())
+contagens, subcategorias = explore_taxonomy()
 ```
+
+`explore_taxonomy()` itera documentos brutos via `data_source.iter_raw_docs()`,
+contornando a curadoria de propósito — é a ferramenta que informa a decisão de
+aprovar uma categoria, não pode depender da aprovação já ter acontecido.
 
 `APPROVED_CATEGORIES`/`BLOCKED_ITEM_IDS` são editados manualmente em
 `sistema_de_recomendacao_v3.py`, como qualquer alteração de código — revisado e
@@ -156,7 +190,7 @@ cada interação em `interaction_log.jsonl`):
 ```bash
 python sistema_de_recomendacao_v3.py
 ```
-Documente o pipeline atual para carregar, limpar, testar o dataset e executar o programa no readme.md
+
 Em notebook/Colab:
 
 ```python

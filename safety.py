@@ -21,6 +21,9 @@ import pandas as pd
 
 import sistema_de_recomendacao_v3 as sysrec
 
+# Import de data_source é local (dentro de explore_taxonomy), não no topo do arquivo:
+# evita import circular (data_source importa safety.apply_safety_filter).
+
 
 def apply_safety_filter(df: pd.DataFrame) -> pd.DataFrame:
     """Aplica as quatro camadas de curadoria e devolve só os itens seguros."""
@@ -64,22 +67,35 @@ def _matches_denylist_keyword(row) -> bool:
     return any(term in haystack for term in sysrec.SAFETY_DENYLIST_KEYWORDS)
 
 
-def explore_taxonomy(collection) -> list:
+def explore_taxonomy():
     """
     Roda uma vez, manualmente, para levantar todas as combinações
-    (dataset, category, subcategories) existentes no banco. Usar o resultado para
-    popular APPROVED_CATEGORIES em sistema_de_recomendacao_v3.py após revisão humana
-    (ver seção 5.1 do plano).
+    (dataset, category, subcategories) existentes no backend ativo (mongo ao vivo ou
+    json_export local, conforme sysrec.DATA_BACKEND). Usar o resultado para popular
+    APPROVED_CATEGORIES em sistema_de_recomendacao_v3.py após revisão humana.
 
-    Consulta somente leitura (aggregate sem $out/$merge) — não escreve nada de volta
-    no banco; salvar a saída localmente (arquivo texto/JSON) para revisão manual.
+    Itera documentos BRUTOS via data_source.iter_raw_docs(), contornando a curadoria
+    de segurança de propósito -- é assim que se decide o que a curadoria deve
+    aprovar, não pode depender da aprovação já ter acontecido. No backend mongo, a
+    leitura é somente find(), nunca escreve nada de volta no banco; salvar a saída
+    localmente (arquivo texto/JSON) para revisão manual.
     """
-    pipeline = [
-        {"$group": {
-            "_id": {"dataset": "$sourceMeta.dataset", "category": "$category"},
-            "subcats": {"$addToSet": "$subcategories"},
-            "count": {"$sum": 1},
-        }},
-        {"$sort": {"_id.dataset": 1, "_id.category": 1}},
-    ]
-    return list(collection.aggregate(pipeline))
+    import data_source
+    from collections import Counter, defaultdict
+
+    counts: Counter = Counter()
+    subcats_by_key: dict = defaultdict(set)
+
+    for doc in data_source.iter_raw_docs():
+        dataset = ((doc.get("sourceMeta") or {}).get("dataset")
+                   or (doc.get("source") or {}).get("dataset") or "")
+        category = doc.get("category", "")
+        key = (dataset, category)
+        counts[key] += 1
+        subcats_by_key[key].update(doc.get("subcategories") or [])
+
+    for key in sorted(counts, key=lambda k: (k[0], k[1])):
+        dataset, category = key
+        print(f"{dataset:16s} {category:24s} n={counts[key]:5d}  "
+              f"subcats={sorted(subcats_by_key[key])}")
+    return counts, subcats_by_key

@@ -1,22 +1,25 @@
 """
-Testes de aceitação da auditoria de normalização e da curadoria de segurança
-(ver seção 7 do plano). Roda sem Mongo real: usa uma FakeCollection em memória que
-implementa só find()/aggregate(), o suficiente para exercitar data_source.py,
-safety.py e normalization.py de ponta a ponta.
+Testes de aceitação da auditoria de normalização e da curadoria de segurança, sobre
+os backends "mongo" (coleções separadas por modalidade, ver MONGO_COLLECTIONS) e
+"json_export" (arquivos locais em dbs/, ver JSON_EXPORT_DIR). Roda sem Mongo real:
+usa uma FakeCollection em memória que implementa só find(), o suficiente para
+exercitar data_source.py, safety.py e normalization.py de ponta a ponta.
 
 Não é integrado ao --eval do sistema_de_recomendacao_v3.py (que é a bancada do
-protótipo, sempre sobre o CSV sintético) -- este arquivo testa especificamente os três
-módulos novos desta migração para Mongo. Roda como script, sem framework de teste
-(mesmo estilo de sanity_checks() em sistema_de_recomendacao_v3.py: funções que
-imprimem PASS/FAIL, sem dependência de pytest).
+protótipo, sempre sobre o CSV sintético) -- este arquivo testa especificamente os
+módulos novos desta migração para Mongo/json_export. Roda como script, sem framework
+de teste (mesmo estilo de sanity_checks() em sistema_de_recomendacao_v3.py: funções
+que imprimem PASS/FAIL, sem dependência de pytest).
 
 Uso:
     python test_data_pipeline.py
 """
 import io
+import json
 import os
 import re
 import sys
+import tempfile
 from contextlib import redirect_stdout
 
 import numpy as np
@@ -38,10 +41,10 @@ def _check(name: str, condition: bool, detail: str = "") -> None:
 
 
 class FakeCollection:
-    """Substitui pymongo.Collection nos testes: find()/aggregate() sobre uma lista de
-    dicts em memória. Não implementa update/insert/delete de propósito -- se algum
-    código sob teste tentasse chamar um desses métodos, o teste quebraria com
-    AttributeError, o que é o comportamento correto a se ter."""
+    """Substitui pymongo.Collection nos testes: find() sobre uma lista de dicts em
+    memória. Não implementa update/insert/delete de propósito -- se algum código sob
+    teste tentasse chamar um desses métodos, o teste quebraria com AttributeError, o
+    que é o comportamento correto a se ter."""
 
     def __init__(self, docs: list):
         self._docs = docs
@@ -49,18 +52,6 @@ class FakeCollection:
     def find(self, query: dict | None = None):
         query = query or {}
         return [doc for doc in self._docs if self._matches(doc, query)]
-
-    def aggregate(self, pipeline: list):
-        # Suficiente para o pipeline usado em safety.explore_taxonomy
-        # ($group por dataset/category + $addToSet + $sum, depois $sort).
-        docs = list(self._docs)
-        result = docs
-        for stage in pipeline:
-            if "$group" in stage:
-                result = self._group(result, stage["$group"])
-            elif "$sort" in stage:
-                result = self._sort(result, stage["$sort"])
-        return result
 
     @staticmethod
     def _matches(doc: dict, query: dict) -> bool:
@@ -80,42 +71,46 @@ class FakeCollection:
                 return False
         return True
 
-    @staticmethod
-    def _group(docs: list, spec: dict) -> list:
-        buckets = {}
-        for doc in docs:
-            key = tuple(data_source._get(doc, path.lstrip("$")) for path in spec["_id"].values())
-            bucket = buckets.setdefault(key, {"_id": dict(zip(spec["_id"].keys(), key)), "count": 0, "subcats": set()})
-            bucket["count"] += 1
-        return [{**b, "subcats": list(b["subcats"])} for b in buckets.values()]
 
-    @staticmethod
-    def _sort(docs: list, spec: dict) -> list:
-        for field, direction in reversed(list(spec.items())):
-            path = field.split(".")
-            docs = sorted(docs, key=lambda d: _dig(d, path), reverse=(direction < 0))
-        return docs
+def _fake_mongo_backend(video: list = None, audio: list = None, image: list = None) -> None:
+    """Monkeypatcha data_source.get_read_only_client para devolver uma FakeCollection
+    por modalidade (espelhando MONGO_COLLECTIONS: uma coleção por modalidade, não uma
+    coleção única com campo mediaType) e força sysrec.DATA_BACKEND = 'mongo', que é o
+    que iter_raw_docs() consulta para decidir por onde iterar."""
+    by_modality = {"video": video or [], "audio": audio or [], "image": image or []}
+    sysrec.DATA_BACKEND = "mongo"
+    data_source.get_read_only_client = lambda modality: FakeCollection(by_modality[modality])
 
 
-def _dig(d: dict, path: list):
-    for key in path:
-        d = d.get(key, {}) if isinstance(d, dict) else {}
-    return d if not isinstance(d, dict) else ""
+# ---------- Documentos fake, um grupo por modalidade (uma coleção cada, sem campo
+# mediaType -- a modalidade é dada por qual coleção/lista o documento veio) ----------
 
-
-# ---------- Documentos fake, cobrindo os casos da seção 7 ----------
-
-DOCS = [
+DOCS_VIDEO = [
     # 1) vídeo OASIS válido, categoria aprovada -> deve passar.
     {
-        "_id": "v1", "mediaType": "video", "title": "Praia ao pôr do sol",
+        "_id": "v1", "title": "Praia ao pôr do sol",
         "ratings": {"valenceMean": 0.6, "arousalMean": -0.3},
         "durationSeconds": 120, "tags": ["nature", "calm"], "category": "nature",
         "sourceMeta": {"dataset": "OASIS"}, "videoOctant": 8, "videoUrl": "http://x/v1",
     },
+    # 7) vídeo com categoria aprovada, mas item_id vai para BLOCKED_ITEM_IDS -> excluído (Camada 4).
+    {
+        "_id": "v2", "title": "Bloqueado manualmente",
+        "ratings": {"valenceMean": 0.5, "arousalMean": -0.2},
+        "durationSeconds": 60, "tags": ["nature"], "category": "nature",
+        "sourceMeta": {"dataset": "OASIS"}, "videoOctant": 8,
+    },
+    # 9) vídeo sem V/A (ratings ausente) -> descartado por va_ausente.
+    {
+        "_id": "v3", "title": "Sem avaliação",
+        "durationSeconds": 30, "category": "nature", "sourceMeta": {"dataset": "OASIS"},
+    },
+]
+
+DOCS_AUDIO = [
     # 2) áudio DEAM válido, categoria aprovada -> deve passar.
     {
-        "_id": "a1", "mediaType": "audio", "title": "Chuva suave",
+        "_id": "a1", "title": "Chuva suave",
         "staticAnnotations": {"valenceNormalized": 0.1, "arousalNormalized": -0.6},
         "source": {"dataset": "DEAM"}, "durationSeconds": 180,
         "tags": ["rain"], "category": "ambient", "soundOctant": 7, "audioUrl": "http://x/a1",
@@ -124,41 +119,30 @@ DOCS = [
     #    categoria aprovada. Quadrante vem de tags/subcategories (formato
     #    "quadrant_qN"), nunca de staticAnnotations -- ver correção da seção 5.
     {
-        "_id": "a2", "mediaType": "audio", "title": "Trilha alegre",
+        "_id": "a2", "title": "Trilha alegre",
         "source": {"dataset": "EMOPIA"}, "durationSeconds": 90,
         "tags": ["quadrant_q1", "energetic"], "category": "music_energetic",
     },
     # 4) áudio EMOPIA SEM quadrante reconhecido nas tags -> descartado (va_ausente), não incluído com nulo.
     {
-        "_id": "a3", "mediaType": "audio", "title": "Sem quadrante",
+        "_id": "a3", "title": "Sem quadrante",
         "source": {"dataset": "EMOPIA"}, "tags": ["ambient"],
         "category": "music_energetic",
     },
+]
+
+DOCS_IMAGE = [
     # 5) imagem com keyword de denylist na tag, categoria aprovada -> deve ser excluída (Camada 2).
     {
-        "_id": "i1", "mediaType": "image", "title": "Cena de guerra",
+        "_id": "i1", "title": "Cena de guerra",
         "ratings": {"valenceNormalized": -0.5, "arousalNormalized": 0.7},
         "tags": ["war"], "category": "nature", "sourceMeta": {"dataset": "OASIS"},
     },
     # 6) imagem com valência muito negativa, categoria NÃO aprovada -> excluída (Camadas 1+3).
     {
-        "_id": "i2", "mediaType": "image", "title": "Estímulo aversivo",
+        "_id": "i2", "title": "Estímulo aversivo",
         "ratings": {"valenceNormalized": -0.9, "arousalNormalized": 0.5},
         "tags": [], "category": "aversive_research", "sourceMeta": {"dataset": "GAPED"},
-    },
-    # 7) vídeo com categoria aprovada, mas item_id vai para BLOCKED_ITEM_IDS -> excluído (Camada 4).
-    {
-        "_id": "v2", "mediaType": "video", "title": "Bloqueado manualmente",
-        "ratings": {"valenceMean": 0.5, "arousalMean": -0.2},
-        "durationSeconds": 60, "tags": ["nature"], "category": "nature",
-        "sourceMeta": {"dataset": "OASIS"}, "videoOctant": 8,
-    },
-    # 8) modalidade desconhecida -> descartada antes mesmo da curadoria.
-    {"_id": "x1", "mediaType": "haptic", "title": "Modalidade nova"},
-    # 9) vídeo sem V/A (ratings ausente) -> descartado por va_ausente.
-    {
-        "_id": "v3", "mediaType": "video", "title": "Sem avaliação",
-        "durationSeconds": 30, "category": "nature", "sourceMeta": {"dataset": "OASIS"},
     },
 ]
 
@@ -183,11 +167,24 @@ def test_write_methods_absent():
     _check("1. nenhuma chamada de escrita no código-fonte", not offenders, f"encontrados em: {offenders}")
 
 
+def test_pymongo_import_is_local_not_module_level():
+    """Import de pymongo deve estar dentro de get_read_only_client, não no topo do
+    arquivo -- senão `import data_source` exigiria pymongo instalado mesmo para quem
+    só usa os backends 'csv'/'json_export'."""
+    content = open(os.path.join(REPO_DIR, "data_source.py"), encoding="utf-8").read()
+    top_level = content.split("def get_read_only_client")[0]
+    _check(
+        "pymongo importado apenas dentro de get_read_only_client, não no topo do módulo",
+        "import pymongo" not in top_level and "from pymongo" not in top_level,
+        top_level,
+    )
+
+
 def test_empty_allowlist_returns_empty_catalog():
     """Teste 2: APPROVED_CATEGORIES vazio -> DataFrame vazio, sem exceção, sem travar."""
     sysrec.APPROVED_CATEGORIES.clear()
     sysrec.BLOCKED_ITEM_IDS.clear()
-    data_source.get_read_only_client = lambda: FakeCollection(DOCS)
+    _fake_mongo_backend(video=DOCS_VIDEO, audio=DOCS_AUDIO, image=DOCS_IMAGE)
 
     try:
         catalog = data_source.load_catalog()
@@ -207,7 +204,7 @@ def test_approved_category_filters_correctly():
     })
     sysrec.BLOCKED_ITEM_IDS.clear()
     sysrec.BLOCKED_ITEM_IDS.add("v2")
-    data_source.get_read_only_client = lambda: FakeCollection(DOCS)
+    _fake_mongo_backend(video=DOCS_VIDEO, audio=DOCS_AUDIO, image=DOCS_IMAGE)
 
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -237,10 +234,11 @@ def test_approved_category_filters_correctly():
         a_ok = abs(row["Arousal"] - 0.5) < 1e-6
         _check("EMOPIA Q1 resolve para o centroide (0.5, 0.5)", v_ok and a_ok, f"got ({row['Valencia']}, {row['Arousal']})")
 
-    # Descartes: modalidade desconhecida, V/A ausente (vídeo v3 e EMOPIA sem quadrante).
+    # Descartes: V/A ausente (vídeo v3 e EMOPIA a3 sem quadrante). Não há mais a
+    # categoria "modalidade_desconhecida" -- cada coleção já é uma modalidade fixa.
     _check(
-        "descartes reportados por motivo (modalidade_desconhecida e va_ausente)",
-        "modalidade_desconhecida=1" in output and "va_ausente=2" in output,
+        "descartes reportados por motivo (va_ausente)",
+        "va_ausente=2" in output,
         f"saída: {output.strip().splitlines()[-1] if output else '(vazia)'}",
     )
 
@@ -270,10 +268,8 @@ def test_extract_emopia_quadrant():
 def test_scale_none_is_skipped_generically():
     """
     Teste 7 (adaptado): datasets com scale=None são pulados com aviso, sem erro nem
-    fórmula assumida. EmoMadrid e MuVi -- os dois scale=None originais -- foram
-    resolvidos nesta rodada de correções (seções 2 e 3), então o mecanismo é testado
-    aqui com uma entrada temporária injetada em NORMALIZATION_REFERENCE, não com um
-    dataset real (que não existe mais no estado 'não confirmado').
+    fórmula assumida. audit_dataset checa scale=None ANTES de tocar em
+    iter_raw_docs/backend, então este teste não precisa de nenhum backend fake.
     """
     import normalization
 
@@ -283,7 +279,7 @@ def test_scale_none_is_skipped_generically():
     try:
         buf = io.StringIO()
         with redirect_stdout(buf):
-            discrepancias = normalization.audit_dataset(FakeCollection([]), "_FAKE_UNCONFIRMED")
+            discrepancias = normalization.audit_dataset("_FAKE_UNCONFIRMED")
         _check(
             "7. scale=None é pulado sem erro (mecanismo genérico)",
             discrepancias == [] and "PULAR" in buf.getvalue(),
@@ -301,11 +297,11 @@ def test_emomadrid_scale_confirmed_by_example():
     """
     import normalization
 
-    fake = FakeCollection([
+    _fake_mongo_backend(video=[
         {"_id": "em1", "sourceMeta": {"dataset": "EmoMadrid"},
          "ratings": {"valenceMean": 1.13, "valenceNormalized": 0.565}},
     ])
-    discrepancias = normalization.audit_dataset(fake, "EmoMadrid")
+    discrepancias = normalization.audit_dataset("EmoMadrid")
     _check("EmoMadrid (-2,2): exemplo real bate sem discrepância", discrepancias == [], f"{discrepancias}")
 
 
@@ -316,11 +312,11 @@ def test_meditation_local_scale_confirmed_by_example():
     """
     import normalization
 
-    fake = FakeCollection([
+    _fake_mongo_backend(video=[
         {"_id": "ml1", "source": {"dataset": "MEDITATION_LOCAL"},
          "staticAnnotations": {"valenceMean": 6.8, "valenceNormalized": 0.45}},
     ])
-    discrepancias = normalization.audit_dataset(fake, "MEDITATION_LOCAL")
+    discrepancias = normalization.audit_dataset("MEDITATION_LOCAL")
     _check("MEDITATION_LOCAL (1,9): exemplo real bate sem discrepância", discrepancias == [], f"{discrepancias}")
 
 
@@ -332,13 +328,13 @@ def test_muvi_identity_range_check():
     """
     import normalization
 
-    fake = FakeCollection([
+    _fake_mongo_backend(video=[
         {"_id": "mv1", "sourceMeta": {"dataset": "MuVi"},
          "ratings": {"valenceMean": -0.0017458, "arousalMean": 0.479212}},  # exemplo real, dentro da faixa
         {"_id": "mv2", "sourceMeta": {"dataset": "MuVi"},
          "ratings": {"valenceMean": 1.5, "arousalMean": 0.2}},  # fora de [-1,1], injetado
     ])
-    discrepancias = normalization.audit_dataset(fake, "MuVi")
+    discrepancias = normalization.audit_dataset("MuVi")
     _check(
         "MuVi (IDENTITY): detecta valor fora de [-1,1], exemplo real não é sinalizado",
         len(discrepancias) == 1 and discrepancias[0]["id"] == "mv2",
@@ -351,7 +347,7 @@ def test_muvi_identity_range_check():
 # armazenado em staticAnnotations diverge -- é exatamente esse valor que deve ser
 # ignorado por normalize_audio_doc.
 _EMOPIA_SPURIOUS_EXAMPLE = {
-    "_id": "quadrant_q1_example", "mediaType": "audio", "title": "Exemplo real EMOPIA",
+    "_id": "quadrant_q1_example", "title": "Exemplo real EMOPIA",
     "source": {"dataset": "EMOPIA"},
     "staticAnnotations": {
         "valenceMean": -0.0427, "valenceNormalized": -0.0427,
@@ -476,13 +472,13 @@ def test_audit_detects_injected_discrepancy():
 
     # OASIS: escala (1, 7). raw=7 (máximo) deveria normalizar para +1.0; armazenamos
     # errado de propósito (-5.0) para confirmar que a auditoria detecta a discrepância.
-    fake = FakeCollection([
+    _fake_mongo_backend(video=[
         {"_id": "d1", "sourceMeta": {"dataset": "OASIS"},
          "ratings": {"valenceMean": 7, "valenceNormalized": -5.0}},
         {"_id": "d2", "sourceMeta": {"dataset": "OASIS"},
          "ratings": {"valenceMean": 4, "valenceNormalized": 0.0}},  # correto, sem discrepância
     ])
-    discrepancias = normalization.audit_dataset(fake, "OASIS")
+    discrepancias = normalization.audit_dataset("OASIS")
     _check(
         "6. discrepância injetada é detectada, e só ela",
         len(discrepancias) == 1 and discrepancias[0]["id"] == "d1",
@@ -495,7 +491,7 @@ def test_determinism():
     sysrec.APPROVED_CATEGORIES.clear()
     sysrec.APPROVED_CATEGORIES.update({("OASIS", "nature"), ("DEAM", "ambient")})
     sysrec.BLOCKED_ITEM_IDS.clear()
-    data_source.get_read_only_client = lambda: FakeCollection(DOCS)
+    _fake_mongo_backend(video=DOCS_VIDEO, audio=DOCS_AUDIO, image=DOCS_IMAGE)
 
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -509,7 +505,7 @@ def test_statistical_checks_run_without_error():
     inclusive detectando um valor fora de [-1, 1] injetado de propósito."""
     import normalization
 
-    fake = FakeCollection([
+    _fake_mongo_backend(video=[
         {"_id": "s1", "sourceMeta": {"dataset": "OASIS"}, "videoOctant": 1,
          "ratings": {"valenceNormalized": 1.4, "arousalNormalized": 0.2}},  # fora de [-1,1] de propósito
         {"_id": "s2", "sourceMeta": {"dataset": "OASIS"}, "videoOctant": 1,
@@ -519,9 +515,9 @@ def test_statistical_checks_run_without_error():
     ok = True
     try:
         with redirect_stdout(buf):
-            normalization.check_out_of_range(fake)
-            normalization.check_zero_variance(fake)
-            normalization.check_octant_region_agreement(fake)
+            normalization.check_out_of_range()
+            normalization.check_zero_variance()
+            normalization.check_octant_region_agreement()
     except Exception as exc:
         ok = False
         print(f"      exceção inesperada: {exc!r}")
@@ -533,8 +529,120 @@ def test_statistical_checks_run_without_error():
     )
 
 
+# ---------- Backend json_export (arquivos locais em dbs/) ----------
+
+def test_unwrap_extended_json():
+    result = data_source._unwrap_extended_json({
+        "_id": {"$oid": "abc"}, "createdAt": {"$date": "2026-01-01T00:00:00Z"}, "x": 1,
+    })
+    _check(
+        "_unwrap_extended_json: _id/datas viram tipos nativos, não dicts aninhados",
+        result == {"_id": "abc", "createdAt": "2026-01-01T00:00:00Z", "x": 1},
+        f"{result}",
+    )
+
+
+def test_load_json_export_reads_only_from_dbs_dir():
+    """dbs/ é o diretório de referência único (instrução explícita do usuário) --
+    _load_json_export/_resolve_json_path só encontram arquivos ali, nunca em outro
+    diretório mesmo que o nome bata (diferente da busca em múltiplos candidatos usada
+    para o CSV em resolve_dataset_path)."""
+    with tempfile.TemporaryDirectory() as tmp_dbs:
+        original_dir = sysrec.JSON_EXPORT_DIR
+        sysrec.JSON_EXPORT_DIR = tmp_dbs
+        try:
+            docs = [{"_id": {"$oid": "x1"}, "title": "a"}, {"_id": {"$oid": "x2"}, "title": "b"}]
+            with open(os.path.join(tmp_dbs, "videos.json"), "w", encoding="utf-8") as fh:
+                json.dump(docs, fh)
+
+            loaded = data_source._load_json_export("videos.json")
+            _check(
+                "_load_json_export lê de dbs/ e desembrulha _id para string",
+                len(loaded) == 2 and loaded[0]["_id"] == "x1" and isinstance(loaded[0]["_id"], str),
+                f"{loaded}",
+            )
+
+            try:
+                data_source._resolve_json_path("nao_existe.json")
+                achou_fora = False
+            except FileNotFoundError:
+                achou_fora = True
+            _check("_resolve_json_path lança FileNotFoundError para arquivo ausente em dbs/", achou_fora)
+        finally:
+            sysrec.JSON_EXPORT_DIR = original_dir
+
+
+def test_load_from_json_export_missing_modality_no_exception():
+    """Só videos.json presente -> load_from_json_export não lança exceção, avisa
+    sobre audios.json/images.json ausentes, e devolve DataFrame normalmente."""
+    with tempfile.TemporaryDirectory() as tmp_dbs:
+        original_dir = sysrec.JSON_EXPORT_DIR
+        sysrec.JSON_EXPORT_DIR = tmp_dbs
+        sysrec.APPROVED_CATEGORIES.clear()
+        sysrec.BLOCKED_ITEM_IDS.clear()
+        try:
+            docs = [{
+                "_id": {"$oid": "v1"}, "title": "Praia", "category": "nature",
+                "sourceMeta": {"dataset": "OASIS"}, "tags": ["nature"],
+                "ratings": {"valenceMean": 0.6, "arousalMean": -0.3},
+                "durationSeconds": 120,
+            }]
+            with open(os.path.join(tmp_dbs, "videos.json"), "w", encoding="utf-8") as fh:
+                json.dump(docs, fh)
+
+            buf = io.StringIO()
+            ok = True
+            catalog = None
+            try:
+                with redirect_stdout(buf):
+                    catalog = data_source.load_from_json_export()
+            except Exception as exc:
+                ok = False
+                print(f"      exceção inesperada: {exc!r}")
+            output = buf.getvalue()
+            _check(
+                "load_from_json_export com só videos.json não lança exceção e avisa das modalidades ausentes",
+                ok and catalog is not None and "audio" in output and "image" in output,
+                output,
+            )
+        finally:
+            sysrec.JSON_EXPORT_DIR = original_dir
+
+
+def test_iter_raw_docs_json_export_dataset_filter_case_insensitive():
+    with tempfile.TemporaryDirectory() as tmp_dbs:
+        original_dir = sysrec.JSON_EXPORT_DIR
+        original_backend = sysrec.DATA_BACKEND
+        sysrec.JSON_EXPORT_DIR = tmp_dbs
+        sysrec.DATA_BACKEND = "json_export"
+        try:
+            docs = [
+                {"_id": "mv1", "sourceMeta": {"dataset": "MuVi"}, "title": "a"},
+                {"_id": "mv2", "sourceMeta": {"dataset": "OtherDataset"}, "title": "b"},
+            ]
+            with open(os.path.join(tmp_dbs, "videos.json"), "w", encoding="utf-8") as fh:
+                json.dump(docs, fh)
+            # audios.json/images.json ausentes de propósito -- iter_raw_docs deve
+            # pular essas modalidades silenciosamente, sem lançar exceção.
+
+            found_lower = list(data_source.iter_raw_docs(modality="video", dataset_filter="muvi"))
+            found_exact = list(data_source.iter_raw_docs(modality="video", dataset_filter="MuVi"))
+            found_all_modalities = list(data_source.iter_raw_docs(dataset_filter="MuVi"))
+            _check(
+                "iter_raw_docs(json_export): dataset_filter insensível a maiúsculas, "
+                "ignora modalidade sem export sem lançar exceção",
+                len(found_lower) == 1 and len(found_exact) == 1 and found_lower[0]["_id"] == "mv1"
+                and len(found_all_modalities) == 1,
+                f"lower={found_lower} exact={found_exact} all={found_all_modalities}",
+            )
+        finally:
+            sysrec.JSON_EXPORT_DIR = original_dir
+            sysrec.DATA_BACKEND = original_backend
+
+
 def main() -> None:
     test_write_methods_absent()
+    test_pymongo_import_is_local_not_module_level()
     test_empty_allowlist_returns_empty_catalog()
     test_approved_category_filters_correctly()
     test_extract_emopia_quadrant()
@@ -549,6 +657,10 @@ def main() -> None:
     test_audit_detects_injected_discrepancy()
     test_determinism()
     test_statistical_checks_run_without_error()
+    test_unwrap_extended_json()
+    test_load_json_export_reads_only_from_dbs_dir()
+    test_load_from_json_export_missing_modality_no_exception()
+    test_iter_raw_docs_json_export_dataset_filter_case_insensitive()
 
     print()
     if _FAILURES:

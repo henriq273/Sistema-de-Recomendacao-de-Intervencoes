@@ -1,5 +1,5 @@
 """
-Sistema de Recomendação de Intervenções — v3
+Sistema de Recomendação de Intervenções para o Bem-Estar
 
   - Configuração central (constantes de rede, RL, PER, guardrail, etc.)
   - Núcleo: carga do dataset, geometria dos oitantes (Circumplexo) e
@@ -75,16 +75,42 @@ LOW_ENERGY_OCTANTS = (5, 6)      # Triste/Deprimido, Entediado/Cansado
 SAFETY_AROUSAL_THRESHOLD = 0.6   # itens acima disso são bloqueados nesses estados
 
 # Fonte de dados: "csv" usa load_dataset() (dataset.csv, bancada de teste/protótipo);
-# "mongo" usa data_source.load_catalog() (banco real, read-only). Fica em "csv" por
-# padrão porque MONGO_URI abaixo ainda é um placeholder — trocar para "mongo" só depois
-# de MONGO_URI/MONGO_DB/MONGO_COLLECTION apontarem para um banco real e de
-# APPROVED_CATEGORIES ter sido populada (ver data_source.py e safety.py).
+# "json_export" usa data_source.load_from_json_export() (arquivos locais gerados por
+# mongoexport --jsonArray, um por modalidade, ver JSON_EXPORT_DIR/JSON_EXPORT_PATHS --
+# sem exigir conexão nem pymongo instalado além do necessário para ler os arquivos);
+# "mongo" usa data_source.load_catalog() (banco real, read-only, conexão ao vivo). Fica
+# em "csv" por padrão porque MONGO_URI abaixo ainda é um placeholder — trocar para
+# "mongo" só depois de MONGO_URI/MONGO_DB/MONGO_COLLECTIONS apontarem para um banco real
+# e de APPROVED_CATEGORIES ter sido populada (ver data_source.py e safety.py).
 DATA_BACKEND = "csv"
 
 # Conexão Mongo (somente leitura)
 MONGO_URI = "mongodb://<host>/<db>?readPreference=secondary"  # ajustar; usar usuário read-only se disponível
 MONGO_DB = "nome_do_banco"
-MONGO_COLLECTION = "interventions"  # ajustar ao nome real
+
+# Coleções separadas por modalidade -- confirmado a partir do comando usado para gerar
+# o export real de vídeo (`mongoexport --collection videos`): a infraestrutura real
+# mantém uma coleção por modalidade, não uma única coleção "interventions" com um campo
+# mediaType (suposição do placeholder original, incorreta).
+MONGO_COLLECTIONS = {
+    "video": "videos",
+    "audio": "audios",   # confirmar nome exato quando o export de áudio existir
+    "image": "images",   # confirmar nome exato quando o export de imagem existir
+}
+
+# Diretório de referência onde os arquivos exportados via `mongoexport --jsonArray`
+# ficam armazenados -- pasta dbs/ na raiz do projeto, único local pesquisado (sem a
+# busca em múltiplos candidatos usada para o CSV em resolve_dataset_path).
+JSON_EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dbs")
+
+# Nome do arquivo de export por modalidade, dentro de JSON_EXPORT_DIR. Modalidade cujo
+# arquivo ainda não existir é pulada com aviso, não bloqueia as demais -- permite testar
+# com exports parciais (ex.: só vídeo, por enquanto).
+JSON_EXPORT_PATHS = {
+    "video": "videos.json",
+    "audio": "audios.json",
+    "image": "images.json",
+}
 
 # Referência de normalização por dataset (para auditoria, normalization.py)
 # scale=None significa "escala não confirmada na fonte original — não assumir fórmula
@@ -317,17 +343,24 @@ def load_active_catalog(dataset_path: str = None) -> pd.DataFrame:
     """
     Ponto único de carga do catálogo, despachado por DATA_BACKEND:
       - "csv": load_dataset() (dataset.csv, bancada de teste/protótipo)
+      - "json_export": data_source.load_from_json_export() (arquivos locais em
+        dbs/, gerados por mongoexport --jsonArray; não exige conexão nem pymongo)
       - "mongo": data_source.load_catalog() (banco real, read-only; nunca escreve)
-    Import de data_source é local (não no topo do arquivo): evita import circular
-    (data_source importa este módulo para ler MONGO_URI etc.) e não força a
-    dependência de pymongo em quem só usa o backend CSV.
+    Import de data_source é local em todos os ramos que o usam: evita import circular
+    (data_source importa este módulo para ler MONGO_URI/JSON_EXPORT_PATHS etc.) e não
+    força pymongo em quem só usa 'csv' ou 'json_export'.
     """
     if DATA_BACKEND == "mongo":
         import data_source
         return data_source.load_catalog()
+    if DATA_BACKEND == "json_export":
+        import data_source
+        return data_source.load_from_json_export()
     if DATA_BACKEND == "csv":
         return load_dataset(dataset_path)
-    raise ValueError(f"DATA_BACKEND desconhecido: {DATA_BACKEND!r} (use 'csv' ou 'mongo').")
+    raise ValueError(
+        f"DATA_BACKEND desconhecido: {DATA_BACKEND!r} (use 'csv', 'json_export' ou 'mongo')."
+    )
 
 
 def target_point(curr_oct: int, dest_oct: int, iso_alpha: float = ISO_ALPHA) -> np.ndarray:
