@@ -5,7 +5,7 @@ esquema único usado pelo resto do sistema.
 Restrição de infraestrutura, inegociável: este módulo nunca escreve no banco. Toda
 leitura é via find()/aggregate() sem $out/$merge; nenhuma chamada de
 update/insert/delete é aceitável aqui. Bloqueio de itens perigosos é feito
-inteiramente em código versionado (ver safety_rules.py), como filtro em memória
+inteiramente em código versionado (ver safety.py), como filtro em memória
 aplicado depois da leitura e antes de qualquer uso do item pelo modelo.
 
 load_catalog() é o substituto direto de sistema_de_recomendacao_v3.load_dataset(): o
@@ -15,7 +15,7 @@ sistema_de_recomendacao_v3.py), sem tocar em FeatureSpace/Agent/Recommender.
 import pandas as pd
 from pymongo import MongoClient
 
-import safety_rules
+import safety
 import sistema_de_recomendacao_v3 as sysrec
 
 # Esquema unificado por item, antes da adaptação para as colunas do FeatureSpace.
@@ -68,7 +68,7 @@ def normalize_video_doc(doc: dict) -> dict:
         "nome": doc.get("title", ""),
         "tipo_modalidade": "video",
         # já costuma vir perto de [-1,1]; CONFIRMAR fonte antes de assumir (ver
-        # audit_normalization.py e NORMALIZATION_REFERENCE em sistema_de_recomendacao_v3.py)
+        # normalization.py e NORMALIZATION_REFERENCE em sistema_de_recomendacao_v3.py)
         "valencia_norm": _get(doc, "ratings.valenceMean"),
         "arousal_norm": _get(doc, "ratings.arousalMean"),
         "duracao_segundos": doc.get("durationSeconds"),
@@ -177,7 +177,7 @@ def load_catalog() -> pd.DataFrame:
     """
     Lê o catálogo completo do Mongo (somente leitura via find(), nunca escreve),
     normaliza por modalidade, aplica a curadoria de segurança
-    (safety_rules.apply_safety_filter) e devolve um DataFrame com as mesmas colunas
+    (safety.apply_safety_filter) e devolve um DataFrame com as mesmas colunas
     semânticas que FeatureSpace já espera — substituto direto de load_dataset() no
     ponto de entrada do sistema.
     """
@@ -204,7 +204,7 @@ def load_catalog() -> pd.DataFrame:
 
     raw_df = pd.DataFrame(rows, columns=UNIFIED_SCHEMA_FIELDS)
     before_safety = len(raw_df)
-    safe_df = safety_rules.apply_safety_filter(raw_df)
+    safe_df = safety.apply_safety_filter(raw_df)
     discard_counts["curadoria_seguranca"] = before_safety - len(safe_df)
 
     catalog = _to_feature_space_schema(safe_df)

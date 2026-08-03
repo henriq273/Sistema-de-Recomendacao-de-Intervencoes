@@ -15,9 +15,9 @@ Sistema de Recomendação de Intervenções — v3
 Módulos companheiros (fora deste arquivo, ver DATA_BACKEND acima):
   - data_source.py — leitura read-only do Mongo e normalização por modalidade,
     alternativa a load_dataset() quando DATA_BACKEND="mongo"
-  - safety_rules.py — curadoria de segurança em memória (allowlist/denylist/
+  - safety.py — curadoria de segurança em memória (allowlist/denylist/
     bloqueio por ID/revisão geométrica), chamada por data_source.load_catalog()
-  - audit_normalization.py — script standalone de auditoria dos campos
+  - normalization.py — script standalone de auditoria dos campos
     normalizados; não faz parte do caminho de produção
 """
 import json
@@ -78,15 +78,15 @@ SAFETY_AROUSAL_THRESHOLD = 0.6   # itens acima disso são bloqueados nesses esta
 # "mongo" usa data_source.load_catalog() (banco real, read-only). Fica em "csv" por
 # padrão porque MONGO_URI abaixo ainda é um placeholder — trocar para "mongo" só depois
 # de MONGO_URI/MONGO_DB/MONGO_COLLECTION apontarem para um banco real e de
-# APPROVED_CATEGORIES ter sido populada (ver data_source.py e safety_rules.py).
+# APPROVED_CATEGORIES ter sido populada (ver data_source.py e safety.py).
 DATA_BACKEND = "csv"
 
-# ---------- Conexão Mongo (somente leitura) ----------
+# Conexão Mongo (somente leitura)
 MONGO_URI = "mongodb://<host>/<db>?readPreference=secondary"  # ajustar; usar usuário read-only se disponível
 MONGO_DB = "nome_do_banco"
 MONGO_COLLECTION = "interventions"  # ajustar ao nome real
 
-# ---------- Referência de normalização por dataset (para auditoria, audit_normalization.py) ----------
+# Referência de normalização por dataset (para auditoria, normalization.py)
 # scale=None significa "escala não confirmada na fonte original — não assumir fórmula
 # sem checar a documentação do dataset antes de rodar a auditoria sobre ele".
 NORMALIZATION_REFERENCE = {
@@ -95,12 +95,11 @@ NORMALIZATION_REFERENCE = {
     "GAPED":     {"raw_field": "ratings.valenceMean",           "scale": (0, 100)},
     "EmoMadrid": {"raw_field": "ratings.valenceMean",           "scale": None},
     "MuVi":      {"raw_field": "ratings.valenceMean",           "scale": None},
-    # EMOPIA não tem campo contínuo — tratado à parte, ver EMOPIA_QUADRANT_CENTROIDS.
+    # EMOPIA não tem campo contínuo — tratado à parte em EMOPIA_QUADRANT_CENTROIDS.
 }
 NORMALIZATION_TOLERANCE = 0.05  # diferença máxima aceitável entre normalizado e recalculado
 
-# EMOPIA anota só quadrante (Q1-Q4), não V/A contínuo. Este mapeamento é uma DECISÃO
-# DO PROJETO, não um dado herdado da fonte — documentar isso no relatório de auditoria.
+# EMOPIA anota só quadrante (Q1-Q4), não V/A contínuo.
 EMOPIA_QUADRANT_CENTROIDS = {
     "Q1": (0.5, 0.5),    # alta valência, alto arousal
     "Q2": (-0.5, 0.5),   # baixa valência, alto arousal
@@ -108,10 +107,10 @@ EMOPIA_QUADRANT_CENTROIDS = {
     "Q4": (0.5, -0.5),   # alta valência, baixo arousal
 }
 
-# ---------- Curadoria de segurança (vive só em código, nunca no banco) ----------
+# Curadoria de segurança (vive só em código, sem alterar o banco)
 # Allowlist: só (dataset, category) explicitamente aprovados entram no catálogo.
 # Começa vazia de propósito — cresce conforme a taxonomia real é levantada e revisada
-# (ver safety_rules.explore_taxonomy). Com o conjunto vazio, load_catalog() devolve um
+# (ver safety.explore_taxonomy). Com o conjunto vazio, load_catalog() devolve um
 # DataFrame vazio: é o comportamento seguro por padrão, não um bug.
 APPROVED_CATEGORIES = set()
 
@@ -133,9 +132,9 @@ SAFETY_MIN_VALENCE_REVIEW = -0.6
 WARMUP_INTERACTIONS = 50    # num. de feedbacks reais até confiar totalmente no DQN
 
 # Escala de recompensa / feedback (cabeça categórica)
-# FEEDBACK_LEVELS é a única fonte de verdade: a rede (nº de saídas), o texto do CLI, o
+# FEEDBACK_LEVELS é a única fonte de verdade: a rede (n° de saídas), o texto do CLI, o
 # log e o HL-Gauss se ajustam automaticamente a partir daqui — mudar a granularidade
-# (nº de níveis) não exige tocar em mais nada.
+# (n° de níveis) não exige tocar em mais nada.
 FEEDBACK_LEVELS = {
     1: "Muito ruim / piorou bastante",
     2: "Ruim / não funcionou",
@@ -144,7 +143,7 @@ FEEDBACK_LEVELS = {
     5: "Muito bom / muito eficaz",
 }
 N_REWARD_LEVELS = len(FEEDBACK_LEVELS)
-# Suporte fixo em [-1, 1]: a amplitude da recompensa não depende do nº de níveis, só a
+# Suporte fixo em [-1, 1]: a amplitude da recompensa não depende do n° de níveis, só a
 # granularidade — isso isola a perda, o clipping de gradiente e o PER de mudanças
 # futuras na escala de feedback.
 REWARD_SUPPORT = tuple(2.0 * i / (N_REWARD_LEVELS - 1) - 1.0 for i in range(N_REWARD_LEVELS))
@@ -1391,7 +1390,7 @@ def main(dataset_path: str = None, carregar: str = None, salvar: str = CHECKPOIN
          interativo: bool = True) -> Recommender:
     """
     Chamável sem argumentos. Em notebook/Colab:
-        from sistema_de_recomendacao_v2 import main
+        from sistema_de_recomendacao_v3 import main
         main()
         main(dataset_path="/content/drive/MyDrive/.../dataset.csv")
     """

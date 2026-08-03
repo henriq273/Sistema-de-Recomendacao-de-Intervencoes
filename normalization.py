@@ -11,7 +11,7 @@ em NORMALIZATION_REFERENCE, e reporta discrepâncias. Datasets com scale=None s�
 pulados com aviso explícito — nunca com uma fórmula assumida silenciosamente.
 
 Uso:
-    python audit_normalization.py
+    python normalization.py
 """
 import numpy as np
 

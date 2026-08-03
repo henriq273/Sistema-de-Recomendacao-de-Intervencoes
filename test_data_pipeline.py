@@ -2,7 +2,7 @@
 Testes de aceitação da auditoria de normalização e da curadoria de segurança
 (ver seção 7 do plano). Roda sem Mongo real: usa uma FakeCollection em memória que
 implementa só find()/aggregate(), o suficiente para exercitar data_source.py,
-safety_rules.py e audit_normalization.py de ponta a ponta.
+safety.py e normalization.py de ponta a ponta.
 
 Não é integrado ao --eval do sistema_de_recomendacao_v3.py (que é a bancada do
 protótipo, sempre sobre o CSV sintético) -- este arquivo testa especificamente os três
@@ -22,7 +22,7 @@ from contextlib import redirect_stdout
 import numpy as np
 
 import data_source
-import safety_rules
+import safety
 import sistema_de_recomendacao_v3 as sysrec
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +51,7 @@ class FakeCollection:
         return [doc for doc in self._docs if self._matches(doc, query)]
 
     def aggregate(self, pipeline: list):
-        # Suficiente para o pipeline usado em safety_rules.explore_taxonomy
+        # Suficiente para o pipeline usado em safety.explore_taxonomy
         # ($group por dataset/category + $addToSet + $sum, depois $sort).
         docs = list(self._docs)
         result = docs
@@ -258,12 +258,12 @@ def test_resolve_non_continuous_va():
 def test_normalization_reference_scale_none_is_skipped():
     """Teste 7: datasets com scale=None são pulados com aviso, sem erro nem fórmula assumida."""
     fake = FakeCollection([])
-    import audit_normalization
+    import normalization
 
     for dataset_name in ("MuVi", "EmoMadrid"):
         buf = io.StringIO()
         with redirect_stdout(buf):
-            discrepancias = audit_normalization.audit_dataset(fake, dataset_name)
+            discrepancias = normalization.audit_dataset(fake, dataset_name)
         _check(
             f"7. {dataset_name} (scale=None) é pulado sem erro",
             discrepancias == [] and "PULAR" in buf.getvalue(),
@@ -271,8 +271,8 @@ def test_normalization_reference_scale_none_is_skipped():
 
 
 def test_audit_detects_injected_discrepancy():
-    """Teste 6: audit_normalization detecta uma discrepância injetada de propósito."""
-    import audit_normalization
+    """Teste 6: normalization detecta uma discrepância injetada de propósito."""
+    import normalization
 
     # OASIS: escala (1, 7). raw=7 (máximo) deveria normalizar para +1.0; armazenamos
     # errado de propósito (-5.0) para confirmar que a auditoria detecta a discrepância.
@@ -282,7 +282,7 @@ def test_audit_detects_injected_discrepancy():
         {"_id": "d2", "sourceMeta": {"dataset": "OASIS"},
          "ratings": {"valenceMean": 4, "valenceNormalized": 0.0}},  # correto, sem discrepância
     ])
-    discrepancias = audit_normalization.audit_dataset(fake, "OASIS")
+    discrepancias = normalization.audit_dataset(fake, "OASIS")
     _check(
         "6. discrepância injetada é detectada, e só ela",
         len(discrepancias) == 1 and discrepancias[0]["id"] == "d1",
@@ -307,7 +307,7 @@ def test_determinism():
 def test_statistical_checks_run_without_error():
     """Checagens estatísticas complementares (seção 6): rodam sem erro sobre dados fake,
     inclusive detectando um valor fora de [-1, 1] injetado de propósito."""
-    import audit_normalization
+    import normalization
 
     fake = FakeCollection([
         {"_id": "s1", "sourceMeta": {"dataset": "OASIS"}, "videoOctant": 1,
@@ -319,9 +319,9 @@ def test_statistical_checks_run_without_error():
     ok = True
     try:
         with redirect_stdout(buf):
-            audit_normalization.check_out_of_range(fake)
-            audit_normalization.check_zero_variance(fake)
-            audit_normalization.check_octant_region_agreement(fake)
+            normalization.check_out_of_range(fake)
+            normalization.check_zero_variance(fake)
+            normalization.check_octant_region_agreement(fake)
     except Exception as exc:
         ok = False
         print(f"      exceção inesperada: {exc!r}")
