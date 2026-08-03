@@ -120,16 +120,18 @@ DOCS = [
         "source": {"dataset": "DEAM"}, "durationSeconds": 180,
         "tags": ["rain"], "category": "ambient", "soundOctant": 7, "audioUrl": "http://x/a1",
     },
-    # 3) áudio EMOPIA com quadrante reconhecido -> resolve via centroide, categoria aprovada.
+    # 3) áudio EMOPIA com quadrante reconhecido via tag -> resolve via centroide,
+    #    categoria aprovada. Quadrante vem de tags/subcategories (formato
+    #    "quadrant_qN"), nunca de staticAnnotations -- ver correção da seção 5.
     {
         "_id": "a2", "mediaType": "audio", "title": "Trilha alegre",
-        "source": {"dataset": "EMOPIA"}, "quadrant": "Q1", "durationSeconds": 90,
-        "tags": ["energetic"], "category": "music_energetic",
+        "source": {"dataset": "EMOPIA"}, "durationSeconds": 90,
+        "tags": ["quadrant_q1", "energetic"], "category": "music_energetic",
     },
-    # 4) áudio EMOPIA SEM quadrante reconhecido -> descartado (va_ausente), não incluído com nulo.
+    # 4) áudio EMOPIA SEM quadrante reconhecido nas tags -> descartado (va_ausente), não incluído com nulo.
     {
         "_id": "a3", "mediaType": "audio", "title": "Sem quadrante",
-        "source": {"dataset": "EMOPIA"}, "quadrant": "desconhecido",
+        "source": {"dataset": "EMOPIA"}, "tags": ["ambient"],
         "category": "music_energetic",
     },
     # 5) imagem com keyword de denylist na tag, categoria aprovada -> deve ser excluída (Camada 2).
@@ -243,31 +245,229 @@ def test_approved_category_filters_correctly():
     )
 
 
-def test_resolve_non_continuous_va():
-    """Teste 8: centroide correto para quadrante válido, (None, None) para inválido/ausente."""
-    v, a = data_source._resolve_non_continuous_va({"quadrant": "Q3"}, "EMOPIA")
-    _check("8a. EMOPIA Q3 -> centroide (-0.5, -0.5)", (v, a) == (-0.5, -0.5))
+def test_extract_emopia_quadrant():
+    """Teste 8: quadrante extraído de tags/subcategories (formato 'quadrant_qN'),
+    nunca de um campo 'quadrant' solto ou de staticAnnotations (ver correção da
+    seção 5 do plano de revisões -- staticAnnotations é espúrio para EMOPIA)."""
+    _check(
+        "8a. EMOPIA com tag quadrant_q3 -> 'Q3'",
+        data_source._extract_emopia_quadrant({"tags": ["quadrant_q3", "calm"]}) == "Q3",
+    )
+    _check(
+        "8b. EMOPIA com subcategories quadrant_q2 (maiúsculas) -> 'Q2'",
+        data_source._extract_emopia_quadrant({"tags": [], "subcategories": ["QUADRANT_Q2"]}) == "Q2",
+    )
+    _check(
+        "8c. EMOPIA sem tag de quadrante -> None",
+        data_source._extract_emopia_quadrant({"tags": ["ambient"]}) is None,
+    )
+    _check(
+        "8d. EMOPIA sem tags/subcategories -> None",
+        data_source._extract_emopia_quadrant({}) is None,
+    )
 
-    v, a = data_source._resolve_non_continuous_va({"quadrant": "Q9"}, "EMOPIA")
-    _check("8b. EMOPIA quadrante desconhecido -> (None, None)", (v, a) == (None, None))
 
-    v, a = data_source._resolve_non_continuous_va({}, "EMOPIA")
-    _check("8c. EMOPIA sem campo quadrant -> (None, None)", (v, a) == (None, None))
-
-
-def test_normalization_reference_scale_none_is_skipped():
-    """Teste 7: datasets com scale=None são pulados com aviso, sem erro nem fórmula assumida."""
-    fake = FakeCollection([])
+def test_scale_none_is_skipped_generically():
+    """
+    Teste 7 (adaptado): datasets com scale=None são pulados com aviso, sem erro nem
+    fórmula assumida. EmoMadrid e MuVi -- os dois scale=None originais -- foram
+    resolvidos nesta rodada de correções (seções 2 e 3), então o mecanismo é testado
+    aqui com uma entrada temporária injetada em NORMALIZATION_REFERENCE, não com um
+    dataset real (que não existe mais no estado 'não confirmado').
+    """
     import normalization
 
-    for dataset_name in ("MuVi", "EmoMadrid"):
+    sysrec.NORMALIZATION_REFERENCE["_FAKE_UNCONFIRMED"] = {
+        "raw_field": "ratings.valenceMean", "scale": None,
+    }
+    try:
         buf = io.StringIO()
         with redirect_stdout(buf):
-            discrepancias = normalization.audit_dataset(fake, dataset_name)
+            discrepancias = normalization.audit_dataset(FakeCollection([]), "_FAKE_UNCONFIRMED")
         _check(
-            f"7. {dataset_name} (scale=None) é pulado sem erro",
+            "7. scale=None é pulado sem erro (mecanismo genérico)",
             discrepancias == [] and "PULAR" in buf.getvalue(),
         )
+    finally:
+        del sysrec.NORMALIZATION_REFERENCE["_FAKE_UNCONFIRMED"]
+
+
+def test_emomadrid_scale_confirmed_by_example():
+    """
+    Correção seção 2: fórmula (-2,2) confirmada com o par real
+    valenceMean=1.13 -> valenceNormalized=0.565 (1.13/2 = 0.565). A escala 1-9
+    tradicional (assumida antes desta correção) dava (1.13-5)/4 = -0.9675, que NÃO
+    bate -- é exatamente o cálculo que motivou a correção.
+    """
+    import normalization
+
+    fake = FakeCollection([
+        {"_id": "em1", "sourceMeta": {"dataset": "EmoMadrid"},
+         "ratings": {"valenceMean": 1.13, "valenceNormalized": 0.565}},
+    ])
+    discrepancias = normalization.audit_dataset(fake, "EmoMadrid")
+    _check("EmoMadrid (-2,2): exemplo real bate sem discrepância", discrepancias == [], f"{discrepancias}")
+
+
+def test_meditation_local_scale_confirmed_by_example():
+    """
+    Correção seção 4: escala (1,9) confirmada pela própria description do dado
+    ("x' = (x - 5) / 4"). Exemplo real: valenceMean=6.8 -> (6.8-5)/4 = 0.45.
+    """
+    import normalization
+
+    fake = FakeCollection([
+        {"_id": "ml1", "source": {"dataset": "MEDITATION_LOCAL"},
+         "staticAnnotations": {"valenceMean": 6.8, "valenceNormalized": 0.45}},
+    ])
+    discrepancias = normalization.audit_dataset(fake, "MEDITATION_LOCAL")
+    _check("MEDITATION_LOCAL (1,9): exemplo real bate sem discrepância", discrepancias == [], f"{discrepancias}")
+
+
+def test_muvi_identity_range_check():
+    """
+    Correção seção 3: MuVi não tem campo *Normalized separado (scale="IDENTITY") --
+    a auditoria vira checagem de faixa sobre o valor bruto, usado diretamente. Exemplo
+    real (dentro da faixa) + um caso injetado fora de [-1,1] para confirmar detecção.
+    """
+    import normalization
+
+    fake = FakeCollection([
+        {"_id": "mv1", "sourceMeta": {"dataset": "MuVi"},
+         "ratings": {"valenceMean": -0.0017458, "arousalMean": 0.479212}},  # exemplo real, dentro da faixa
+        {"_id": "mv2", "sourceMeta": {"dataset": "MuVi"},
+         "ratings": {"valenceMean": 1.5, "arousalMean": 0.2}},  # fora de [-1,1], injetado
+    ])
+    discrepancias = normalization.audit_dataset(fake, "MuVi")
+    _check(
+        "MuVi (IDENTITY): detecta valor fora de [-1,1], exemplo real não é sinalizado",
+        len(discrepancias) == 1 and discrepancias[0]["id"] == "mv2",
+        f"{discrepancias}",
+    )
+
+
+# Item de exemplo real do EMOPIA usado na correção crítica da seção 5: quadrante,
+# tags e oitante concordam entre si (alta valência, alto arousal); só o valor
+# armazenado em staticAnnotations diverge -- é exatamente esse valor que deve ser
+# ignorado por normalize_audio_doc.
+_EMOPIA_SPURIOUS_EXAMPLE = {
+    "_id": "quadrant_q1_example", "mediaType": "audio", "title": "Exemplo real EMOPIA",
+    "source": {"dataset": "EMOPIA"},
+    "staticAnnotations": {
+        "valenceMean": -0.0427, "valenceNormalized": -0.0427,
+        "arousalMean": -0.3747, "arousalNormalized": -0.3747,
+    },
+    "annotationType": "russell_4q_inferred_va_from_reference_octant_centroid",
+    "description": "Valence/arousal inferred from audio_deam_ octant centroid",
+    "tags": ["quadrant_q1", "positive_valence", "high_arousal"],
+    "soundOctant": 7,
+}
+
+
+def test_emopia_spurious_value_ignored_uses_quadrant():
+    """Correção crítica (seção 5): normalize_audio_doc deve ignorar o valor espúrio
+    armazenado e usar sempre o centroide do quadrante extraído das tags."""
+    row = data_source.normalize_audio_doc(_EMOPIA_SPURIOUS_EXAMPLE)
+    v_ok = abs(row["valencia_norm"] - 0.5) < 1e-9
+    a_ok = abs(row["arousal_norm"] - 0.5) < 1e-9
+    nao_espurio = row["valencia_norm"] != -0.0427 and row["arousal_norm"] != -0.3747
+    _check(
+        "EMOPIA espúrio -> normalize_audio_doc usa centroide de Q1 (0.5, 0.5), não o valor armazenado",
+        v_ok and a_ok and nao_espurio,
+        f"got ({row['valencia_norm']}, {row['arousal_norm']})",
+    )
+
+
+def test_internal_consistency_flags_emopia_before_and_after():
+    """
+    Seções 5 e 6: check_internal_consistency, aplicado ao valor espúrio antigo do
+    item de exemplo, encontra 3+ contradições simultâneas (tags de valência e de
+    arousal, quadrante) -- é essa multiplicidade que classifica como severo, não
+    ambiguidade de fronteira. Aplicado ao valor já corrigido (centroide de Q1), as
+    contradições de tag/quadrante desaparecem (pode restar divergência de oitante
+    geométrico, que é esperada e vai para revisão de baixa prioridade, não para
+    correção de código -- ver contraste com meditation_local na seção 5.3 do plano).
+    """
+    import normalization
+
+    row_antes = {
+        "item_id": "quadrant_q1_example", "dataset": "EMOPIA",
+        "valencia_norm": -0.0427, "arousal_norm": -0.3747,  # valor espúrio, pré-correção
+        "tags": ["quadrant_q1", "positive_valence", "high_arousal"], "octant_raw": 7,
+    }
+    problems_antes = normalization.check_internal_consistency(row_antes)
+    _check(
+        "consistência ANTES da correção: 3+ problemas para o item espúrio do EMOPIA",
+        len(problems_antes) >= 3,
+        f"{problems_antes}",
+    )
+
+    row_depois = dict(row_antes)
+    row_depois["valencia_norm"], row_depois["arousal_norm"] = sysrec.EMOPIA_QUADRANT_CENTROIDS["Q1"]
+    problems_depois = normalization.check_internal_consistency(row_depois)
+    problemas_tag_ou_quadrante = [p for p in problems_depois if "tag " in p or "contradiz sinal" in p]
+    _check(
+        "consistência DEPOIS da correção: sem contradição de tag/quadrante (só pode restar oitante)",
+        problemas_tag_ou_quadrante == [],
+        f"{problems_depois}",
+    )
+
+
+def test_consistency_audit_severity_drops_after_correction():
+    """
+    Item 7 da seção 9 (adaptado -- sem Mongo real para rodar sobre o catálogo
+    completo): demonstra sobre o item de exemplo que run_consistency_audit classifica
+    como severo o valor espúrio antigo e deixa de classificar como severo o valor já
+    corrigido.
+    """
+    import normalization
+    import pandas as pd
+
+    catalogo_antes = pd.DataFrame([{
+        "item_id": "quadrant_q1_example", "dataset": "EMOPIA",
+        "valencia_norm": -0.0427, "arousal_norm": -0.3747,
+        "tags": ["quadrant_q1", "positive_valence", "high_arousal"], "octant_raw": 7,
+    }])
+    severos_antes, _ = normalization.run_consistency_audit(catalogo_antes)
+
+    catalogo_depois = pd.DataFrame([{
+        "item_id": "quadrant_q1_example", "dataset": "EMOPIA",
+        "valencia_norm": 0.5, "arousal_norm": 0.5,
+        "tags": ["quadrant_q1", "positive_valence", "high_arousal"], "octant_raw": 7,
+    }])
+    severos_depois, _ = normalization.run_consistency_audit(catalogo_depois)
+
+    _check(
+        "run_consistency_audit: contagem de severos cai a 0 após a correção do EMOPIA",
+        len(severos_antes) == 1 and len(severos_depois) == 0,
+        f"antes={severos_antes} depois={severos_depois}",
+    )
+
+
+def test_dataset_field_path_por_modalidade():
+    """
+    Seção 7: regressão explícita -- áudio usa source.dataset, vídeo e imagem usam
+    sourceMeta.dataset. Protege contra uma refatoração futura que "simplifique"
+    isso incorretamente para um caminho único.
+    """
+    audio_doc = {
+        "_id": "reg_a", "source": {"dataset": "DEAM"},
+        "staticAnnotations": {"valenceNormalized": 0.0, "arousalNormalized": 0.0},
+    }
+    video_doc = {"_id": "reg_v", "sourceMeta": {"dataset": "MuVi"}}
+    image_doc = {"_id": "reg_i", "sourceMeta": {"dataset": "OASIS"}}
+    _check(
+        "regressão: áudio lê dataset de source.dataset",
+        data_source.normalize_audio_doc(audio_doc)["dataset"] == "DEAM",
+    )
+    _check(
+        "regressão: vídeo lê dataset de sourceMeta.dataset",
+        data_source.normalize_video_doc(video_doc)["dataset"] == "MuVi",
+    )
+    _check(
+        "regressão: imagem lê dataset de sourceMeta.dataset",
+        data_source.normalize_image_doc(image_doc)["dataset"] == "OASIS",
+    )
 
 
 def test_audit_detects_injected_discrepancy():
@@ -337,8 +537,15 @@ def main() -> None:
     test_write_methods_absent()
     test_empty_allowlist_returns_empty_catalog()
     test_approved_category_filters_correctly()
-    test_resolve_non_continuous_va()
-    test_normalization_reference_scale_none_is_skipped()
+    test_extract_emopia_quadrant()
+    test_scale_none_is_skipped_generically()
+    test_emomadrid_scale_confirmed_by_example()
+    test_meditation_local_scale_confirmed_by_example()
+    test_muvi_identity_range_check()
+    test_emopia_spurious_value_ignored_uses_quadrant()
+    test_internal_consistency_flags_emopia_before_and_after()
+    test_consistency_audit_severity_drops_after_correction()
+    test_dataset_field_path_por_modalidade()
     test_audit_detects_injected_discrepancy()
     test_determinism()
     test_statistical_checks_run_without_error()

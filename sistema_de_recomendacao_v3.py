@@ -89,17 +89,41 @@ MONGO_COLLECTION = "interventions"  # ajustar ao nome real
 # Referência de normalização por dataset (para auditoria, normalization.py)
 # scale=None significa "escala não confirmada na fonte original — não assumir fórmula
 # sem checar a documentação do dataset antes de rodar a auditoria sobre ele".
+# scale="IDENTITY" significa "não há campo *Normalized separado para comparar — o
+# valor bruto já é o valor a usar diretamente" (ver MuVi abaixo e
+# normalization.audit_identity_dataset).
 NORMALIZATION_REFERENCE = {
     "DEAM":      {"raw_field": "staticAnnotations.valenceMean", "scale": (1, 9)},
     "OASIS":     {"raw_field": "ratings.valenceMean",           "scale": (1, 7)},
     "GAPED":     {"raw_field": "ratings.valenceMean",           "scale": (0, 100)},
-    "EmoMadrid": {"raw_field": "ratings.valenceMean",           "scale": None},
-    "MuVi":      {"raw_field": "ratings.valenceMean",           "scale": None},
-    # EMOPIA não tem campo contínuo — tratado à parte em EMOPIA_QUADRANT_CENTROIDS.
+    # (-2, 2) empiricamente confirmado a partir de par (bruto, normalizado) real
+    # (valenceMean=1.13 -> valenceNormalized=0.565 = 1.13/2); NÃO é a escala 1-9
+    # tradicional do IAPS/SAM que se assumiria por analogia com DEAM/OASIS/GAPED.
+    # Confirmação vem de um único exemplo — antes de tratar como definitivo, rodar
+    # audit_dataset(collection, "EmoMadrid") sobre uma amostra maior (~30 itens) e
+    # confirmar taxa de discrepância ~0 (ver seção 2 do plano de revisões).
+    "EmoMadrid": {"raw_field": "ratings.valenceMean",           "scale": (-2, 2)},
+    # Sem campo valenceNormalized/arousalNormalized na estrutura do documento (só
+    # valenceMean/arousalMean/valenceStd/arousalStd/sampleCount) — ausência
+    # estrutural confirmada em exemplo real, não erro de fórmula.
+    "MuVi":      {"raw_field": "ratings.valenceMean",           "scale": "IDENTITY"},
+    # meditation_local: escala confirmada pela própria description do dado
+    # ("Valence/arousal are heuristic values in 1..9 scale normalized with
+    # x' = (x - 5) / 4"), mais forte que inferência de literatura. Rótulos
+    # atribuídos heuristicamente a partir de nome de arquivo/pasta, não por estudo
+    # psicométrico com participantes (diferente de DEAM/OASIS/GAPED/EmoMadrid) —
+    # ver CONFIDENCE_TIER abaixo.
+    "MEDITATION_LOCAL": {"raw_field": "staticAnnotations.valenceMean", "scale": (1, 9)},
+    # EMOPIA não tem campo contínuo confiável — tratado à parte em
+    # EMOPIA_QUADRANT_CENTROIDS. O valor armazenado em staticAnnotations É espúrio
+    # (contradiz tags/oitante/quadrante do próprio documento — ver correção crítica
+    # na seção 5 do plano de revisões) e nunca deve ser usado, nem como fallback.
 }
 NORMALIZATION_TOLERANCE = 0.05  # diferença máxima aceitável entre normalizado e recalculado
 
-# EMOPIA anota só quadrante (Q1-Q4), não V/A contínuo.
+# EMOPIA anota só quadrante (Q1-Q4), não V/A contínuo confiável. Este mapeamento
+# deixou de ser um fallback para valor ausente e passou a ser a ÚNICA fonte de
+# verdade para EMOPIA, sempre — ver data_source.normalize_audio_doc.
 EMOPIA_QUADRANT_CENTROIDS = {
     "Q1": (0.5, 0.5),    # alta valência, alto arousal
     "Q2": (-0.5, 0.5),   # baixa valência, alto arousal
@@ -107,11 +131,26 @@ EMOPIA_QUADRANT_CENTROIDS = {
     "Q4": (0.5, -0.5),   # alta valência, baixo arousal
 }
 
+# Confiabilidade da origem do valor de V/A por dataset: "psychometric" (estudo com
+# participantes) vs "heuristic" (atribuído por julgamento/regra, não medido).
+# Metadado para relatório/ponderação futura — não bloqueante, não usado hoje na
+# seleção ou no treino.
+CONFIDENCE_TIER = {
+    "DEAM": "psychometric", "OASIS": "psychometric", "GAPED": "psychometric",
+    "EmoMadrid": "psychometric", "MuVi": "psychometric",
+    "MEDITATION_LOCAL": "heuristic", "EMOPIA": "heuristic",
+}
+
 # Curadoria de segurança (vive só em código, sem alterar o banco)
 # Allowlist: só (dataset, category) explicitamente aprovados entram no catálogo.
 # Começa vazia de propósito — cresce conforme a taxonomia real é levantada e revisada
 # (ver safety.explore_taxonomy). Com o conjunto vazio, load_catalog() devolve um
 # DataFrame vazio: é o comportamento seguro por padrão, não um bug.
+# ATENÇÃO: não aprovar (EMOPIA, *) até confirmar, via
+# normalization.run_consistency_audit, que os itens de EMOPIA deixaram de ser
+# sinalizados como severos após a correção em data_source.normalize_audio_doc —
+# a allowlist vazia já bloqueia isso por padrão, mas fica documentado aqui para que
+# ninguém aprove a categoria "por engano" antes da correção estar validada.
 APPROVED_CATEGORIES = set()
 
 # Denylist de palavras-chave, aplicada a nome/tags/category.

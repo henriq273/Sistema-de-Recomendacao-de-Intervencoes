@@ -12,6 +12,8 @@ load_catalog() é o substituto direto de sistema_de_recomendacao_v3.load_dataset
 ponto de entrada troca uma chamada pela outra conforme DATA_BACKEND (ver
 sistema_de_recomendacao_v3.py), sem tocar em FeatureSpace/Agent/Recommender.
 """
+import re
+
 import pandas as pd
 from pymongo import MongoClient
 
@@ -22,7 +24,10 @@ import sistema_de_recomendacao_v3 as sysrec
 UNIFIED_SCHEMA_FIELDS = [
     "item_id", "nome", "tipo_modalidade", "valencia_norm", "arousal_norm",
     "duracao_segundos", "tags", "category", "dataset", "octant_raw", "url",
+    "confidence_tier",
 ]
+
+_QUADRANT_TAG_RE = re.compile(r"quadrant_q([1-4])", re.IGNORECASE)
 
 # tipo_modalidade (vocabulário do banco) -> Tipo em português já usado pelo
 # FeatureSpace/simulador. Os datasets afetivos de origem não têm as categorias mais
@@ -50,44 +55,75 @@ def _get(doc: dict, path: str):
     return value
 
 
-def _resolve_non_continuous_va(doc: dict, dataset: str):
-    """Datasets sem campo de V/A contínuo (ex.: EMOPIA, que só anota quadrante
-    Q1-Q4). Resolve via centroide do quadrante quando possível; devolve (None, None)
-    quando não — o documento é descartado em load_catalog() (contado em
-    'va_ausente'), nunca incluído com valor nulo ou com fórmula inventada."""
-    if dataset == "EMOPIA":
-        quadrant = doc.get("quadrant")  # confirmar nome exato do campo no schema real
-        if quadrant in sysrec.EMOPIA_QUADRANT_CENTROIDS:
-            return sysrec.EMOPIA_QUADRANT_CENTROIDS[quadrant]
-    return None, None
+def _extract_emopia_quadrant(doc: dict) -> str | None:
+    """
+    Extrai o quadrante Q1-Q4 de tags/subcategories (formato 'quadrant_qN') — único
+    caminho confiável para o quadrante do EMOPIA.
+
+    CORREÇÃO (ver seção 5 do plano de revisões pós-implementação): o campo contínuo
+    armazenado em staticAnnotations para EMOPIA é espúrio — verificado empiricamente
+    que contradiz as tags do próprio documento, o oitante declarado E o quadrante
+    também declarado, todos ao mesmo tempo, para o mesmo item. O `annotationType`
+    ("russell_4q_inferred_va_from_reference_octant_centroid") e uma `description`
+    que referencia "audio_deam" dentro de um item do EMOPIA indicam bug de geração
+    com parâmetro trocado na ingestão, não ambiguidade legítima de dado. Por isso
+    staticAnnotations NUNCA é usado para EMOPIA, nem como fallback — só o quadrante.
+    """
+    candidatos = (doc.get("tags") or []) + (doc.get("subcategories") or [])
+    for tag in candidatos:
+        m = _QUADRANT_TAG_RE.match(tag)
+        if m:
+            return f"Q{m.group(1)}"
+    return None
 
 
 def normalize_video_doc(doc: dict) -> dict:
+    dataset = _get(doc, "sourceMeta.dataset") or ""
     return {
         "item_id": str(doc["_id"]),
         "nome": doc.get("title", ""),
         "tipo_modalidade": "video",
-        # já costuma vir perto de [-1,1]; CONFIRMAR fonte antes de assumir (ver
-        # normalization.py e NORMALIZATION_REFERENCE em sistema_de_recomendacao_v3.py)
+        # Sem campo *Normalized separado para vídeo/imagem em geral — confirmado que
+        # ratings.valenceMean/arousalMean já é o valor a usar diretamente (ver MuVi,
+        # NORMALIZATION_REFERENCE em sistema_de_recomendacao_v3.py, scale="IDENTITY").
         "valencia_norm": _get(doc, "ratings.valenceMean"),
         "arousal_norm": _get(doc, "ratings.arousalMean"),
         "duracao_segundos": doc.get("durationSeconds"),
         "tags": doc.get("tags", []) or [],
         "category": doc.get("category", ""),
-        "dataset": _get(doc, "sourceMeta.dataset") or "",
+        "dataset": dataset,
         "octant_raw": doc.get("videoOctant"),
         "url": doc.get("videoUrl", ""),
+        "confidence_tier": sysrec.CONFIDENCE_TIER.get(dataset, "unknown"),
     }
 
 
 def normalize_audio_doc(doc: dict) -> dict:
+    # Áudio usa source.dataset (não sourceMeta.dataset, usado por vídeo/imagem) --
+    # confirmado por exemplos reais: documentos de áudio não têm chave sourceMeta, e
+    # os de vídeo/imagem não têm source no mesmo sentido. Ver test_dataset_field_path
+    # _por_modalidade em test_data_pipeline.py, que protege esta distinção de uma
+    # futura refatoração que tente "simplificar" para um caminho único.
     dataset = _get(doc, "source.dataset") or ""
-    if dataset == "DEAM":
+
+    if dataset.upper() == "EMOPIA":
+        # CORREÇÃO CRÍTICA: nunca usar staticAnnotations aqui -- valor demonstravelmente
+        # espúrio e inconsistente com tags/oitante/quadrante no próprio documento (ver
+        # _extract_emopia_quadrant e seção 5 do plano de revisões).
+        quadrant = _extract_emopia_quadrant(doc)
+        if quadrant and quadrant in sysrec.EMOPIA_QUADRANT_CENTROIDS:
+            v, a = sysrec.EMOPIA_QUADRANT_CENTROIDS[quadrant]
+        else:
+            v, a = None, None  # sem quadrante reconhecível -> descartado (va_ausente)
+    elif dataset.upper() == "DEAM":
+        v = _get(doc, "staticAnnotations.valenceNormalized")
+        a = _get(doc, "staticAnnotations.arousalNormalized")
+    elif dataset.upper() == "MEDITATION_LOCAL":
         v = _get(doc, "staticAnnotations.valenceNormalized")
         a = _get(doc, "staticAnnotations.arousalNormalized")
     else:
-        # EMOPIA e outros sem campo contínuo -> centroide de quadrante, se aplicável.
-        v, a = _resolve_non_continuous_va(doc, dataset)
+        v, a = None, None  # dataset de áudio não reconhecido -> descartar, não adivinhar
+
     return {
         "item_id": str(doc["_id"]),
         "nome": doc.get("title", ""),
@@ -100,10 +136,12 @@ def normalize_audio_doc(doc: dict) -> dict:
         "dataset": dataset,
         "octant_raw": doc.get("soundOctant"),
         "url": doc.get("audioUrl", ""),
+        "confidence_tier": sysrec.CONFIDENCE_TIER.get(dataset, "unknown"),
     }
 
 
 def normalize_image_doc(doc: dict) -> dict:
+    dataset = _get(doc, "sourceMeta.dataset") or ""
     return {
         "item_id": str(doc["_id"]),
         "nome": doc.get("title", ""),
@@ -113,9 +151,10 @@ def normalize_image_doc(doc: dict) -> dict:
         "duracao_segundos": doc.get("durationSeconds", 5),  # imagens têm duração arbitrada
         "tags": doc.get("tags", []) or [],
         "category": doc.get("category", ""),
-        "dataset": _get(doc, "sourceMeta.dataset") or "",
+        "dataset": dataset,
         "octant_raw": doc.get("imageOctant"),
         "url": doc.get("imageUrl", ""),
+        "confidence_tier": sysrec.CONFIDENCE_TIER.get(dataset, "unknown"),
     }
 
 
@@ -173,13 +212,16 @@ def _validate_feature_space_schema(df: pd.DataFrame) -> None:
         raise ValueError("Valores de Arousal fora do intervalo [-1, 1] após normalização.")
 
 
-def load_catalog() -> pd.DataFrame:
+def build_raw_catalog() -> tuple[pd.DataFrame, dict]:
     """
-    Lê o catálogo completo do Mongo (somente leitura via find(), nunca escreve),
-    normaliza por modalidade, aplica a curadoria de segurança
-    (safety.apply_safety_filter) e devolve um DataFrame com as mesmas colunas
-    semânticas que FeatureSpace já espera — substituto direto de load_dataset() no
-    ponto de entrada do sistema.
+    Lê o catálogo completo do Mongo (somente leitura via find(), nunca escreve) e
+    normaliza por modalidade para o esquema unificado (UNIFIED_SCHEMA_FIELDS) — SEM
+    aplicar a curadoria de segurança.
+
+    Usado por load_catalog() (que aplica a curadoria em seguida) e por
+    normalization.run_consistency_audit(), que precisa ver os itens ANTES do filtro
+    de segurança: com a allowlist vazia, itens de dataset ainda não revisado (ex.:
+    EMOPIA) nunca apareceriam no catálogo final para serem sinalizados.
     """
     collection = get_read_only_client()
     rows = []
@@ -203,6 +245,18 @@ def load_catalog() -> pd.DataFrame:
         rows.append(row)
 
     raw_df = pd.DataFrame(rows, columns=UNIFIED_SCHEMA_FIELDS)
+    return raw_df, discard_counts
+
+
+def load_catalog() -> pd.DataFrame:
+    """
+    Lê e normaliza o catálogo (build_raw_catalog), aplica a curadoria de segurança
+    (safety.apply_safety_filter) e devolve um DataFrame com as mesmas colunas
+    semânticas que FeatureSpace já espera — substituto direto de load_dataset() no
+    ponto de entrada do sistema.
+    """
+    raw_df, discard_counts = build_raw_catalog()
+
     before_safety = len(raw_df)
     safe_df = safety.apply_safety_filter(raw_df)
     discard_counts["curadoria_seguranca"] = before_safety - len(safe_df)

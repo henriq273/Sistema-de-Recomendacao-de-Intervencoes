@@ -118,11 +118,16 @@ do campo bruto e da escala de origem documentada em `NORMALIZATION_REFERENCE`:
 python normalization.py
 ```
 
-Datasets com escala não confirmada (`scale=None` em `NORMALIZATION_REFERENCE`, ex.:
-MuVi, EmoMadrid) são pulados com aviso explícito — nunca com uma fórmula assumida
-silenciosamente. Também roda três checagens estatísticas complementares (faixa fora de
-`[-1,1]`, desvio-padrão por dataset, comparação de região V-A entre datasets para o
-mesmo oitante rotulado).
+Datasets com escala não confirmada (`scale=None` em `NORMALIZATION_REFERENCE`) são
+pulados com aviso explícito — nunca com uma fórmula assumida silenciosamente. Datasets
+sem campo `*Normalized` separado (`scale="IDENTITY"`, ex.: MuVi) viram uma checagem de
+faixa (`audit_identity_dataset`) em vez da comparação fórmula-vs-armazenado. Também
+roda três checagens estatísticas complementares (faixa fora de `[-1,1]`, desvio-padrão
+por dataset, comparação de região V-A entre datasets para o mesmo oitante rotulado) e
+um checador de consistência interna (`run_consistency_audit`) que cruza tags, oitante
+declarado e quadrante (quando existir) contra o sinal de valência/arousal — foi esse
+checador que revelou que o EMOPIA tinha um valor contínuo armazenado espúrio,
+inconsistente com as próprias tags/oitante/quadrante do item.
 
 ### Testes de aceitação (`test_data_pipeline.py`)
 
@@ -151,7 +156,7 @@ cada interação em `interaction_log.jsonl`):
 ```bash
 python sistema_de_recomendacao_v3.py
 ```
-
+Documente o pipeline atual para carregar, limpar, testar o dataset e executar o programa no readme.md
 Em notebook/Colab:
 
 ```python
@@ -160,7 +165,7 @@ main()
 main(dataset_path="/content/drive/MyDrive/.../dataset.csv")
 ```
 
-A cada recomendação, o feedback é dado em 5 níveis (muito ruim → muito bom), mais a
+A cada recomendação, o feedback é dado em 5 níveis (muito ruim -> muito bom), mais a
 opção de não executar nenhuma intervenção (sem aprendizado nessa rodada).
 
 ## Limpeza de dados residuais
