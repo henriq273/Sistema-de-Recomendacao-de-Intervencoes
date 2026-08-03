@@ -11,6 +11,14 @@ Sistema de Recomendação de Intervenções — v3
   - Simulador e avaliação offline — bancada de teste, não fazem parte do
     caminho de produção (nunca usados para treinar o modelo real)
   - CLI interativo e ponto de entrada
+
+Módulos companheiros (fora deste arquivo, ver DATA_BACKEND acima):
+  - data_source.py — leitura read-only do Mongo e normalização por modalidade,
+    alternativa a load_dataset() quando DATA_BACKEND="mongo"
+  - safety_rules.py — curadoria de segurança em memória (allowlist/denylist/
+    bloqueio por ID/revisão geométrica), chamada por data_source.load_catalog()
+  - audit_normalization.py — script standalone de auditoria dos campos
+    normalizados; não faz parte do caminho de produção
 """
 import json
 import math
@@ -65,6 +73,61 @@ CANDIDATE_POOL_SIZE = 12    # M itens mais próximos do ponto-alvo entram no poo
 USE_SAFETY_FILTER = True
 LOW_ENERGY_OCTANTS = (5, 6)      # Triste/Deprimido, Entediado/Cansado
 SAFETY_AROUSAL_THRESHOLD = 0.6   # itens acima disso são bloqueados nesses estados
+
+# Fonte de dados: "csv" usa load_dataset() (dataset.csv, bancada de teste/protótipo);
+# "mongo" usa data_source.load_catalog() (banco real, read-only). Fica em "csv" por
+# padrão porque MONGO_URI abaixo ainda é um placeholder — trocar para "mongo" só depois
+# de MONGO_URI/MONGO_DB/MONGO_COLLECTION apontarem para um banco real e de
+# APPROVED_CATEGORIES ter sido populada (ver data_source.py e safety_rules.py).
+DATA_BACKEND = "csv"
+
+# ---------- Conexão Mongo (somente leitura) ----------
+MONGO_URI = "mongodb://<host>/<db>?readPreference=secondary"  # ajustar; usar usuário read-only se disponível
+MONGO_DB = "nome_do_banco"
+MONGO_COLLECTION = "interventions"  # ajustar ao nome real
+
+# ---------- Referência de normalização por dataset (para auditoria, audit_normalization.py) ----------
+# scale=None significa "escala não confirmada na fonte original — não assumir fórmula
+# sem checar a documentação do dataset antes de rodar a auditoria sobre ele".
+NORMALIZATION_REFERENCE = {
+    "DEAM":      {"raw_field": "staticAnnotations.valenceMean", "scale": (1, 9)},
+    "OASIS":     {"raw_field": "ratings.valenceMean",           "scale": (1, 7)},
+    "GAPED":     {"raw_field": "ratings.valenceMean",           "scale": (0, 100)},
+    "EmoMadrid": {"raw_field": "ratings.valenceMean",           "scale": None},
+    "MuVi":      {"raw_field": "ratings.valenceMean",           "scale": None},
+    # EMOPIA não tem campo contínuo — tratado à parte, ver EMOPIA_QUADRANT_CENTROIDS.
+}
+NORMALIZATION_TOLERANCE = 0.05  # diferença máxima aceitável entre normalizado e recalculado
+
+# EMOPIA anota só quadrante (Q1-Q4), não V/A contínuo. Este mapeamento é uma DECISÃO
+# DO PROJETO, não um dado herdado da fonte — documentar isso no relatório de auditoria.
+EMOPIA_QUADRANT_CENTROIDS = {
+    "Q1": (0.5, 0.5),    # alta valência, alto arousal
+    "Q2": (-0.5, 0.5),   # baixa valência, alto arousal
+    "Q3": (-0.5, -0.5),  # baixa valência, baixo arousal
+    "Q4": (0.5, -0.5),   # alta valência, baixo arousal
+}
+
+# ---------- Curadoria de segurança (vive só em código, nunca no banco) ----------
+# Allowlist: só (dataset, category) explicitamente aprovados entram no catálogo.
+# Começa vazia de propósito — cresce conforme a taxonomia real é levantada e revisada
+# (ver safety_rules.explore_taxonomy). Com o conjunto vazio, load_catalog() devolve um
+# DataFrame vazio: é o comportamento seguro por padrão, não um bug.
+APPROVED_CATEGORIES = set()
+
+# Denylist de palavras-chave, aplicada a nome/tags/category.
+SAFETY_DENYLIST_KEYWORDS = [
+    "mistreatment", "abuse", "mutilation", "gore", "violence", "violation",
+    "assault", "torture", "disgust", "contamination", "disease", "wound",
+    "war", "atrocity", "norm_violation", "phobia",
+]
+
+# IDs individuais bloqueados após revisão manual, independente de categoria.
+BLOCKED_ITEM_IDS = set()
+
+# Abaixo deste valor de valência normalizada, o item exige aprovação EXPLÍCITA
+# (estar em APPROVED_CATEGORIES) — não passa por default mesmo sem keyword/categoria bloqueada.
+SAFETY_MIN_VALENCE_REVIEW = -0.6
 
 # Cold-start (heurística -> DQN)
 WARMUP_INTERACTIONS = 50    # num. de feedbacks reais até confiar totalmente no DQN
@@ -210,6 +273,23 @@ def load_dataset(path: str = None) -> pd.DataFrame:
         raise ValueError("Valores de Arousal fora do intervalo [-1, 1].")
 
     return df
+
+
+def load_active_catalog(dataset_path: str = None) -> pd.DataFrame:
+    """
+    Ponto único de carga do catálogo, despachado por DATA_BACKEND:
+      - "csv": load_dataset() (dataset.csv, bancada de teste/protótipo)
+      - "mongo": data_source.load_catalog() (banco real, read-only; nunca escreve)
+    Import de data_source é local (não no topo do arquivo): evita import circular
+    (data_source importa este módulo para ler MONGO_URI etc.) e não força a
+    dependência de pymongo em quem só usa o backend CSV.
+    """
+    if DATA_BACKEND == "mongo":
+        import data_source
+        return data_source.load_catalog()
+    if DATA_BACKEND == "csv":
+        return load_dataset(dataset_path)
+    raise ValueError(f"DATA_BACKEND desconhecido: {DATA_BACKEND!r} (use 'csv' ou 'mongo').")
 
 
 def target_point(curr_oct: int, dest_oct: int, iso_alpha: float = ISO_ALPHA) -> np.ndarray:
@@ -1316,7 +1396,7 @@ def main(dataset_path: str = None, carregar: str = None, salvar: str = CHECKPOIN
         main(dataset_path="/content/drive/MyDrive/.../dataset.csv")
     """
     set_seed(SEED)
-    df = load_dataset(dataset_path)
+    df = load_active_catalog(dataset_path)
     feature_space = FeatureSpace(df)
     agent = Agent(df, feature_space)
 
@@ -1344,6 +1424,9 @@ def main(dataset_path: str = None, carregar: str = None, salvar: str = CHECKPOIN
 def _run_offline_evaluation() -> None:
     # Bancada de teste completa: sanity checks, cobertura/diversidade, baselines,
     # uso da escala de feedback e calibração da cabeça categórica.
+    # Sempre sobre o CSV sintético, independente de DATA_BACKEND: é uma bancada fixa e
+    # conhecida (contagens como "22/100 bloqueados" no sanity check pressupõem esse
+    # dataset específico), não o caminho de produção -- ver load_active_catalog() para o backend real.
     set_seed(SEED)
     df = load_dataset()
     feature_space = FeatureSpace(df)
