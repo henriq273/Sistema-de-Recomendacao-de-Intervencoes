@@ -257,6 +257,17 @@ def run_statistical_checks() -> None:
 
 
 if __name__ == "__main__":
+    if sysrec.DATA_BACKEND == "csv":
+        # "csv" é o padrão em sistema_de_recomendacao_v3.py para o catálogo sintético
+        # (dataset.csv), que não tem datasets reais (DEAM/OASIS/GAPED/...) para
+        # auditar -- normalization.py só faz sentido contra o catálogo real. Ao
+        # rodar como script sem configuração prévia, cai para "json_export" (arquivos
+        # locais em dbs/), que não exige Mongo nem pymongo. Para auditar o Mongo ao
+        # vivo, defina DATA_BACKEND = "mongo" em sistema_de_recomendacao_v3.py antes.
+        print("[normalization] DATA_BACKEND='csv' não se aplica à auditoria -- "
+              "usando 'json_export' (dbs/) nesta execução.\n")
+        sysrec.DATA_BACKEND = "json_export"
+
     run_full_audit()
     print()
     run_statistical_checks()
