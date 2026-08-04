@@ -64,7 +64,7 @@ PER_EPSILON = 1e-5           # evita prioridade zero
 # Ponto-alvo no plano (V,A) = atual + ISO_ALPHA * (desejado - atual)
 #   ISO_ALPHA = 1.0 -> mira exatamente o oitante desejado
 #   ISO_ALPHA < 1.0 -> princípio-iso: mira um ponto intermediário, aproximação gradual
-ISO_ALPHA = 1.0
+ISO_ALPHA = 0.9
 
 # Conjunto de candidatos
 CANDIDATE_POOL_SIZE = 12    # M itens mais próximos do ponto-alvo entram no pool
@@ -82,7 +82,7 @@ SAFETY_AROUSAL_THRESHOLD = 0.6   # itens acima disso são bloqueados nesses esta
 # em "csv" por padrão porque MONGO_URI abaixo ainda é um placeholder — trocar para
 # "mongo" só depois de MONGO_URI/MONGO_DB/MONGO_COLLECTIONS apontarem para um banco real
 # e de APPROVED_CATEGORIES ter sido populada (ver data_source.py e safety.py).
-DATA_BACKEND = "csv"
+DATA_BACKEND = "json_export"  # "csv", "json_export" ou "mongo"
 
 # Conexão Mongo (somente leitura)
 MONGO_URI = "mongodb://<host>/<db>?readPreference=secondary"  # ajustar; usar usuário read-only se disponível
@@ -168,15 +168,23 @@ CONFIDENCE_TIER = {
 }
 
 # Curadoria de segurança (vive só em código, sem alterar o banco)
-# Allowlist: só (dataset, category) explicitamente aprovados entram no catálogo.
-# Começa vazia de propósito — cresce conforme a taxonomia real é levantada e revisada
-# (ver safety.explore_taxonomy). Com o conjunto vazio, load_catalog() devolve um
-# DataFrame vazio: é o comportamento seguro por padrão, não um bug.
-# ATENÇÃO: não aprovar (EMOPIA, *) até confirmar, via
-# normalization.run_consistency_audit, que os itens de EMOPIA deixaram de ser
-# sinalizados como severos após a correção em data_source.normalize_audio_doc —
-# a allowlist vazia já bloqueia isso por padrão, mas fica documentado aqui para que
-# ninguém aprove a categoria "por engano" antes da correção estar validada.
+# Camada 1 (allowlist de categoria), liga/desliga: com False, safety.apply_safety_filter
+# não consulta APPROVED_CATEGORIES -- todo item passa por essa camada, qualquer
+# (dataset, category) pode ser recomendado. Decisão explícita do usuário (ver commit):
+# testar o pipeline com o catálogo real inteiro, sem esperar curadoria manual
+# categoria a categoria. Camadas 2 (denylist de keyword) e 4 (bloqueio por item_id)
+# continuam ativas independente deste flag -- são a rede de segurança que resta.
+# Reativar a allowlist: True + popular APPROVED_CATEGORIES (ver safety.explore_taxonomy).
+SAFETY_CATEGORY_ALLOWLIST_ENABLED = False
+
+# Allowlist: só (dataset, category) explicitamente aprovados entram no catálogo QUANDO
+# SAFETY_CATEGORY_ALLOWLIST_ENABLED=True. Começa vazia de propósito — cresce conforme a
+# taxonomia real é levantada e revisada (ver safety.explore_taxonomy). Com o conjunto
+# vazio E o flag ligado, load_catalog() devolve um DataFrame vazio: é o comportamento
+# seguro por padrão, não um bug.
+# ATENÇÃO: se/quando a allowlist for reativada, não aprovar (EMOPIA, *) até confirmar,
+# via normalization.run_consistency_audit, que os itens de EMOPIA deixaram de ser
+# sinalizados como severos após a correção em data_source.normalize_audio_doc.
 APPROVED_CATEGORIES = set()
 
 # Denylist de palavras-chave, aplicada a nome/tags/category.

@@ -181,7 +181,11 @@ def test_pymongo_import_is_local_not_module_level():
 
 
 def test_empty_allowlist_returns_empty_catalog():
-    """Teste 2: APPROVED_CATEGORIES vazio -> DataFrame vazio, sem exceção, sem travar."""
+    """Teste 2: com a Camada 1 REATIVADA (SAFETY_CATEGORY_ALLOWLIST_ENABLED=True) e
+    APPROVED_CATEGORIES vazio -> DataFrame vazio, sem exceção, sem travar. Testa o
+    comportamento seguro por padrão da allowlist quando ligada -- o padrão atual do
+    sistema é a allowlist DESLIGADA (ver test_category_allowlist_disabled_by_default)."""
+    sysrec.SAFETY_CATEGORY_ALLOWLIST_ENABLED = True
     sysrec.APPROVED_CATEGORIES.clear()
     sysrec.BLOCKED_ITEM_IDS.clear()
     _fake_mongo_backend(video=DOCS_VIDEO, audio=DOCS_AUDIO, image=DOCS_IMAGE)
@@ -192,12 +196,16 @@ def test_empty_allowlist_returns_empty_catalog():
     except Exception as exc:  # não deveria lançar
         ok = False
         print(f"      exceção inesperada: {exc!r}")
-    _check("2. allowlist vazia -> catálogo vazio, sem exceção", ok)
+    finally:
+        sysrec.SAFETY_CATEGORY_ALLOWLIST_ENABLED = False
+    _check("2. allowlist vazia (Camada 1 ligada) -> catálogo vazio, sem exceção", ok)
 
 
 def test_approved_category_filters_correctly():
-    """Testes 3, 4 e 5: allowlist populada, denylist de keyword, revisão geométrica e
-    bloqueio por ID -- todos verificados sobre o mesmo carregamento."""
+    """Testes 3, 4 e 5: allowlist populada (Camada 1 REATIVADA para este teste),
+    denylist de keyword, revisão geométrica e bloqueio por ID -- todos verificados
+    sobre o mesmo carregamento."""
+    sysrec.SAFETY_CATEGORY_ALLOWLIST_ENABLED = True
     sysrec.APPROVED_CATEGORIES.clear()
     sysrec.APPROVED_CATEGORIES.update({
         ("OASIS", "nature"), ("DEAM", "ambient"), ("EMOPIA", "music_energetic"),
@@ -209,6 +217,7 @@ def test_approved_category_filters_correctly():
     buf = io.StringIO()
     with redirect_stdout(buf):
         catalog = data_source.load_catalog()
+    sysrec.SAFETY_CATEGORY_ALLOWLIST_ENABLED = False
     output = buf.getvalue()
     print(output, end="")
 
@@ -240,6 +249,51 @@ def test_approved_category_filters_correctly():
         "descartes reportados por motivo (va_ausente)",
         "va_ausente=2" in output,
         f"saída: {output.strip().splitlines()[-1] if output else '(vazia)'}",
+    )
+
+
+def test_category_allowlist_disabled_by_default():
+    """
+    Decisão explícita do usuário: SAFETY_CATEGORY_ALLOWLIST_ENABLED=False é o padrão
+    do sistema -- todo item passa pela Camada 1 (e, por consequência, pela Camada 3,
+    que usa mask_category como parte do OR), mesmo com APPROVED_CATEGORIES vazio e
+    mesmo valência muito negativa (i2, category não aprovada). Só a Camada 2
+    (denylist de keyword, item i1: tag "war") e a Camada 4 (BLOCKED_ITEM_IDS, item
+    v2) continuam bloqueando.
+    """
+    _check(
+        "flag SAFETY_CATEGORY_ALLOWLIST_ENABLED começa em False (padrão do sistema)",
+        sysrec.SAFETY_CATEGORY_ALLOWLIST_ENABLED is False,
+    )
+
+    sysrec.APPROVED_CATEGORIES.clear()  # allowlist vazia, mas IRRELEVANTE com o flag off
+    sysrec.BLOCKED_ITEM_IDS.clear()
+    sysrec.BLOCKED_ITEM_IDS.add("v2")
+    _fake_mongo_backend(video=DOCS_VIDEO, audio=DOCS_AUDIO, image=DOCS_IMAGE)
+
+    catalog = data_source.load_catalog()
+    ids = set(catalog["item_id"])
+
+    _check(
+        "Camada 1 desligada: categoria não aprovada e valência muito negativa (i2) "
+        "não são mais motivo de exclusão",
+        "i2" in ids,
+        f"ids presentes: {sorted(ids)}",
+    )
+    _check(
+        "Camada 1 desligada: item de categoria nunca aprovada (v1/a1) passa mesmo assim",
+        "v1" in ids and "a1" in ids,
+        f"ids presentes: {sorted(ids)}",
+    )
+    _check(
+        "Camada 2 (denylist de keyword) continua ativa independente do flag da Camada 1",
+        "i1" not in ids,
+        f"ids presentes: {sorted(ids)}",
+    )
+    _check(
+        "Camada 4 (bloqueio por item_id) continua ativa independente do flag da Camada 1",
+        "v2" not in ids,
+        f"ids presentes: {sorted(ids)}",
     )
 
 
@@ -645,6 +699,7 @@ def main() -> None:
     test_pymongo_import_is_local_not_module_level()
     test_empty_allowlist_returns_empty_catalog()
     test_approved_category_filters_correctly()
+    test_category_allowlist_disabled_by_default()
     test_extract_emopia_quadrant()
     test_scale_none_is_skipped_generically()
     test_emomadrid_scale_confirmed_by_example()

@@ -108,19 +108,26 @@ A fonte de dados é escolhida pela constante `DATA_BACKEND` no topo de
 
 Curadoria de segurança em `safety.py`, **100% em memória, nunca escreve no banco** —
 chamada automaticamente por `data_source.load_catalog()`/`load_from_json_export()`.
-Quatro camadas, aplicadas nessa ordem:
+Até quatro camadas, aplicadas nessa ordem:
 
-1. **Allowlist de categoria** — só entram itens de `(dataset, category)` explicitamente
-   aprovados em `APPROVED_CATEGORIES` (em `sistema_de_recomendacao_v3.py`). Começa
-   **vazia** de propósito: com a allowlist vazia, o catálogo carregado fica vazio — é
-   o comportamento seguro por padrão, não um bug.
+1. **Allowlist de categoria** — **desativada por padrão** via
+   `SAFETY_CATEGORY_ALLOWLIST_ENABLED = False` (em `sistema_de_recomendacao_v3.py`):
+   decisão explícita para permitir recomendar qualquer `(dataset, category)` do
+   catálogo real, sem depender de curadoria manual categoria a categoria.
+   `APPROVED_CATEGORIES` não é consultada enquanto o flag estiver `False`. Para
+   reativar a allowlist (bloqueia tudo por padrão até popular a lista — comportamento
+   seguro por padrão): `SAFETY_CATEGORY_ALLOWLIST_ENABLED = True` +
+   `APPROVED_CATEGORIES` populada a partir de `explore_taxonomy()` (abaixo).
 2. **Denylist de palavra-chave** — bloqueia itens cujo nome/tags/categoria batam com
    `SAFETY_DENYLIST_KEYWORDS` (termos como "abuse", "violence", "gore", "phobia" etc.).
+   Sempre ativa, independe do flag da Camada 1.
 3. **Revisão geométrica** — valência abaixo de `SAFETY_MIN_VALENCE_REVIEW` exige
    aprovação explícita de categoria (defesa em profundidade, redundante com a Camada 1
-   de propósito).
+   de propósito). Com a Camada 1 desativada, esta camada também para de diferenciar
+   por categoria — mesma razão de redundância, na direção oposta.
 4. **Bloqueio individual por ID** — `BLOCKED_ITEM_IDS`, sempre aplicado por último,
-   nunca sobrescrito pelas camadas anteriores.
+   nunca sobrescrito pelas camadas anteriores. Sempre ativa, independe do flag da
+   Camada 1.
 
 Antes de popular `APPROVED_CATEGORIES`, levantar a taxonomia real do backend ativo
 (`DATA_BACKEND`, seção 1) — consulta só leitura, salvar a saída localmente para

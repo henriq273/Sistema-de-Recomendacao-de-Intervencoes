@@ -1,14 +1,19 @@
 """
 Curadoria de segurança do catálogo — 100% em memória, nunca escreve no banco.
 
-Aplica quatro camadas de filtro sobre o DataFrame já normalizado por data_source.py,
-em memória, antes de qualquer uso do item pelo modelo:
-  1. Allowlist de (dataset, category) — só entra o que foi explicitamente aprovado.
-  2. Denylist de palavra-chave em nome/tags/category.
+Aplica até quatro camadas de filtro sobre o DataFrame já normalizado por
+data_source.py, em memória, antes de qualquer uso do item pelo modelo:
+  1. Allowlist de (dataset, category) — DESATIVADA por padrão (ver
+     sysrec.SAFETY_CATEGORY_ALLOWLIST_ENABLED, decisão explícita do usuário: todo
+     item passa por esta camada enquanto o flag for False). Quando reativada, só
+     entra o que foi explicitamente aprovado em sysrec.APPROVED_CATEGORIES.
+  2. Denylist de palavra-chave em nome/tags/category. Sempre ativa.
   3. Revisão geométrica: valência muito negativa exige aprovação explícita de
      categoria (redundante com a Camada 1 de propósito — defesa em profundidade).
+     Com a Camada 1 desativada, esta camada também deixa de diferenciar por
+     categoria (mesma razão de redundância, na direção oposta).
   4. Bloqueio individual por item_id, sempre por último, nunca sobrescrito pelas
-     camadas anteriores.
+     camadas anteriores. Sempre ativa.
 
 A Camada 4 do processo original (revisão humana da fila prioritária + amostra
 estratificada) não é código — é processo, executado pela equipe sobre os resultados
@@ -26,17 +31,23 @@ import sistema_de_recomendacao_v3 as sysrec
 
 
 def apply_safety_filter(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica as quatro camadas de curadoria e devolve só os itens seguros."""
+    """Aplica as camadas de curadoria ativas e devolve só os itens seguros."""
     before = len(df)
     if before == 0:
         print("Curadoria de segurança: 0 -> 0 itens (DataFrame de entrada já vazio).")
         return df.copy()
 
-    # Camada 1: allowlist de categoria. Com a allowlist vazia (estado inicial), este
-    # passo bloqueia TUDO — é o comportamento seguro por padrão, não um bug.
-    mask_category = df.apply(
-        lambda r: (r["dataset"], r["category"]) in sysrec.APPROVED_CATEGORIES, axis=1
-    )
+    # Camada 1: allowlist de categoria -- liga/desliga via
+    # sysrec.SAFETY_CATEGORY_ALLOWLIST_ENABLED. Desativada (padrão atual, decisão
+    # explícita do usuário): todo item passa por esta camada, sem consultar
+    # APPROVED_CATEGORIES. Ativada: só (dataset, category) explicitamente aprovados
+    # passam; com a allowlist vazia, bloqueia tudo -- comportamento seguro por padrão.
+    if sysrec.SAFETY_CATEGORY_ALLOWLIST_ENABLED:
+        mask_category = df.apply(
+            lambda r: (r["dataset"], r["category"]) in sysrec.APPROVED_CATEGORIES, axis=1
+        )
+    else:
+        mask_category = pd.Series(True, index=df.index)
 
     # Camada 2: denylist de palavra-chave em nome/tags/category.
     mask_keyword = ~df.apply(_matches_denylist_keyword, axis=1)
