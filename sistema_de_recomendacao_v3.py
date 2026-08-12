@@ -19,6 +19,9 @@ Módulos companheiros (fora deste arquivo, ver DATA_BACKEND acima):
     bloqueio por ID/revisão geométrica), chamada por data_source.load_catalog()
   - normalization.py — script standalone de auditoria dos campos
     normalizados; não faz parte do caminho de produção
+  - characterize.py — script standalone de recaracterização estatística do
+    catálogo real e calibração dos limiares do guardrail; não faz parte do
+    caminho de produção
 """
 import json
 import math
@@ -72,7 +75,25 @@ CANDIDATE_POOL_SIZE = 12    # M itens mais próximos do ponto-alvo entram no poo
 # Guardrail de segurança
 USE_SAFETY_FILTER = True
 LOW_ENERGY_OCTANTS = (5, 6)      # Triste/Deprimido, Entediado/Cansado
-SAFETY_AROUSAL_THRESHOLD = 0.6   # itens acima disso são bloqueados nesses estados
+HIGH_ENERGY_OCTANTS = (3, 4)     # Estressado/Ansioso, Irritado/Raiva
+# Limiares calibrados a partir da distribuição REAL do catálogo (dbs/*.json, backend
+# json_export, 6188 itens pós-curadoria), via
+# characterize.calibrate_guardrail_thresholds / calibrate_valence_threshold — não
+# herdados do dataset sintético. 0.6 (valor antigo, sintético) quase não bloquearia
+# nada aqui: o arousal real está centrado perto de 0 (média -0.045, desvio 0.399),
+# bem menos extremo que o sintético.
+# Arousal: candidato mais protetor (menor limiar) entre os percentis testados
+# [50,60,70,75,80,85,90] que ainda mantém pool >= TOP_K em toda a grade curr x
+# dest(ALLOWED_DEST_OCTANTS) x tempo -- percentil 50 (mediana), já válido de saída.
+SAFETY_AROUSAL_THRESHOLD = -0.053           # itens acima disso são bloqueados (R1/R2/R3)
+# Valência: candidato mais protetor (maior limiar, menos negativo) entre os
+# percentis testados [5,10,15,20] que ainda mantém pool >= TOP_K -- percentil 20.
+SAFETY_AVERSIVE_VALENCE_THRESHOLD = -0.390  # itens abaixo disso são bloqueados (R4)
+# Destinos plausíveis para a grade de diagnóstico/calibração (characterize.py): só
+# octantes de valência não-negativa faz sentido como ALVO de uma intervenção --
+# octantes 3-6 (valência negativa) nunca são um destino terapêutico razoável. Não
+# restringe o CLI de produção (dest_oct ainda é livre 1-8 lá), só a varredura.
+ALLOWED_DEST_OCTANTS = (1, 2, 7, 8)
 
 # Fonte de dados: "csv" usa load_dataset() (dataset.csv, bancada de teste/protótipo);
 # "json_export" usa data_source.load_from_json_export() (arquivos locais gerados por
@@ -835,7 +856,7 @@ class Recommender:
         if len(eligible) == 0:
             return []
 
-        eligible = self._apply_safety_filter(eligible, curr_oct)
+        eligible = self._apply_safety_filter(eligible, curr_oct, dest_oct)
         pool_idx, pool_dist = self._candidate_pool(eligible, curr_oct, dest_oct)
 
         user_state = self.feature_space.user_state(curr_oct, dest_oct, time_avail)
@@ -881,21 +902,44 @@ class Recommender:
         self.fatigue.register(np.array([r["item_idx"] for r in results], dtype=int))
         return results
 
-    def _apply_safety_filter(self, eligible: np.ndarray, curr_oct: int) -> np.ndarray:
+    def _apply_safety_filter(self, eligible: np.ndarray, curr_oct: int, dest_oct: int) -> np.ndarray:
         """
-        Guardrail de segurança: bloqueia itens de alta ativação para usuários em estados
-        de baixa energia. Regra dura, independente do que a DQN aprendeu. Um DQN
-        otimiza apenas a recompensa recebida, sem noção de que recomendar atividade de
-        alta ativação física a alguém em estado depressivo pode agravar o quadro.
+        Guardrail de segurança, quatro regras. Regra dura, independente do que a DQN
+        aprendeu -- um DQN otimiza apenas a recompensa recebida, sem noção de que
+        certas recomendações podem agravar o quadro do usuário mesmo que "funcionem"
+        (gerem feedback positivo no curto prazo).
+
+          R1: baixa energia (LOW_ENERGY_OCTANTS) + item de alta ativação -> bloqueia.
+              Regra original: alta ativação física pode agravar um estado depressivo.
+          R2: alta energia/hiperativação (HIGH_ENERGY_OCTANTS) + item de alta ativação
+              -> bloqueia. A versão original só protegia baixa energia (5/6), deixando
+              estados de hiperativação (3/4, estresse/raiva) sem proteção equivalente
+              -- alta ativação também não é o que se quer oferecer a alguém já
+              hiperativado, mesmo que o destino desejado seja outro.
+          R3: destino de valência negativa (ta < 0, octante-alvo aversivo) + item de
+              alta ativação -> bloqueia. Não faz sentido dirigir alguém, com alta
+              ativação, rumo a um estado afetivo negativo.
+          R4: destino de valência positiva (tv > 0) + item muito aversivo (valência
+              abaixo de SAFETY_AVERSIVE_VALENCE_THRESHOLD) -> bloqueia. Item aversivo
+              contradiz o próprio objetivo da recomendação quando o destino é positivo.
         """
-        if not USE_SAFETY_FILTER or curr_oct not in LOW_ENERGY_OCTANTS:
+        if not USE_SAFETY_FILTER:
             return eligible
 
-        self.safety_checked += len(eligible)
-        arousal = self.df.loc[eligible, "Arousal"].to_numpy(dtype=np.float32)
-        safe = eligible[arousal <= SAFETY_AROUSAL_THRESHOLD]
-        self.safety_blocked += len(eligible) - len(safe)
+        A = self.df.loc[eligible, "Arousal"].to_numpy(dtype=np.float32)
+        V = self.df.loc[eligible, "Valencia"].to_numpy(dtype=np.float32)
+        tv, ta = OCTANT_MAP[dest_oct]
 
+        r1 = (curr_oct in LOW_ENERGY_OCTANTS) & (A > SAFETY_AROUSAL_THRESHOLD)
+        r2 = (curr_oct in HIGH_ENERGY_OCTANTS) & (A > SAFETY_AROUSAL_THRESHOLD)
+        r3 = (ta < 0) & (A > SAFETY_AROUSAL_THRESHOLD)
+        r4 = (tv > 0) & (V < SAFETY_AVERSIVE_VALENCE_THRESHOLD)
+        blocked = r1 | r2 | r3 | r4
+
+        self.safety_checked += len(eligible)
+        self.safety_blocked += int(np.sum(blocked))
+
+        safe = eligible[~blocked]
         # Nunca travar: se o filtro esvaziar o conjunto, reverter para o conjunto anterior.
         return safe if len(safe) > 0 else eligible
 
@@ -1015,7 +1059,8 @@ NUNCA deve ser usado para treinar o modelo que interage com usuários reais: tre
 e avaliar contra a mesma heurística faz o modelo apenas imitá-la, introduzindo viés
 e circularidade metodológica."""
 
-HIGH_ENERGY_OCTANTS = (3, 4)
+# HIGH_ENERGY_OCTANTS agora vive na seção de config (guardrail de segurança), usado
+# tanto pelo guardrail de produção quanto pelo simulador abaixo.
 
 
 def _simulate(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> tuple[float, int]:
@@ -1136,12 +1181,17 @@ def sanity_checks(recommender: Recommender, df: pd.DataFrame) -> None:
             changed += other != base
     print(f"[3] Listas alteradas ao mudar o oitante atual: {changed}/{total}")
 
-    # 4. Guardrail bloqueia exatamente 22 itens para oitantes de baixa energia (valor medido no dataset atual).
+    # 4. Guardrail bloqueia uma fração de itens para oitantes de baixa energia. Sem
+    # valor fixo esperado: SAFETY_AROUSAL_THRESHOLD é calibrado a partir da
+    # distribuição REAL do catálogo (ver characterize.py), não do CSV sintético
+    # usado por esta bancada -- a contagem aqui varia com a calibração vigente, é
+    # só diagnóstico visual, não um alvo a bater.
     checked_before, blocked_before = recommender.safety_checked, recommender.safety_blocked
     recommender.recommend(5, 7, 120)
     checked = recommender.safety_checked - checked_before
     blocked = recommender.safety_blocked - blocked_before
-    print(f"[4] Guardrail: {blocked}/{checked} itens bloqueados para o oitante 5 (esperado: 22)")
+    print(f"[4] Guardrail: {blocked}/{checked} itens bloqueados para o oitante 5 "
+          f"(threshold={SAFETY_AROUSAL_THRESHOLD:.3f}, calibrado sobre o catálogo real)")
 
     # 5. Duas chamadas idênticas produzem listas diferentes em fração razoável dos casos.
     trials = 20
