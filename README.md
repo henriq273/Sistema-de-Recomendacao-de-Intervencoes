@@ -23,6 +23,8 @@ Todo o núcleo do sistema (config, features, agente, política de recomendação
 em `sistema_de_recomendacao_v3.py`. Os módulos `data_source.py`, `safety.py` e
 `normalization.py` são companheiros, usados quando a fonte de dados é um catálogo real
 (export JSON local ou MongoDB ao vivo) em vez do `dataset.csv` sintético.
+`characterize.py` e `review_negative_tail.py` são bancadas de diagnóstico/curadoria
+manual, fora do caminho de produção (ver seções 2 e 3 abaixo).
 
 ## Requisitos
 
@@ -43,13 +45,12 @@ pip install numpy pandas torch pymongo
 A fonte de dados é escolhida pela constante `DATA_BACKEND` no topo de
 `sistema_de_recomendacao_v3.py`:
 
-- **`"csv"` (padrão)** — lê `dataset.csv` via `load_dataset()`. Não depende de rede nem
-  de `pymongo`. É o backend usado tanto pelo CLI interativo (com `DATA_BACKEND="csv"`)
-  quanto, **sempre**, pela bancada de teste offline (`--eval`), independentemente do
-  valor de `DATA_BACKEND` — a bancada pressupõe esse dataset sintético específico
-  (ex.: o sanity check de guardrail espera bloquear exatamente 22/100 itens).
+- **`"csv"`** — lê `dataset.csv` via `load_dataset()`. Não depende de rede nem de
+  `pymongo`. É o backend usado **sempre** pela bancada de teste offline (`--eval`),
+  independentemente do valor de `DATA_BACKEND` — a bancada pressupõe esse dataset
+  sintético específico.
 
-- **`"json_export"`** — lê um catálogo real a partir de arquivos locais gerados por
+- **`"json_export"` (padrão)** — lê um catálogo real a partir de arquivos locais gerados por
   `mongoexport --jsonArray`, um por modalidade, **sem depender de conexão viva nem de
   `pymongo` instalado**. Backend pensado para testar a normalização/curadoria contra
   dados reais offline, antes de (ou sem) ter acesso ao Mongo ao vivo.
@@ -140,6 +141,32 @@ aprovar uma categoria, não pode depender da aprovação já ter acontecido.
 `sistema_de_recomendacao_v3.py`, como qualquer alteração de código — revisado e
 versionado em git, nunca escrito de volta no banco.
 
+### Revisão manual da cauda negativa (`review_negative_tail.py`)
+
+A denylist de palavra-chave e a revisão geométrica por valência (Camadas 2 e 3) não
+pegam tudo: a denylist não pega conteúdo perturbador sem palavra-gatilho na
+descrição, e mesmo a Camada 3 não pega tudo, porque a literatura do GAPED documenta
+dessensibilização de avaliador — imagens de categoria negativa podem ter valência
+moderada, não extrema. Para datasets sem taxonomia de categoria dedicada a conteúdo
+negativo (**OASIS**, **EmoMadrid** — diferente do **GAPED**, que tem taxonomia fixa
+documentada e se resolve estruturalmente, aprovando só as categorias `N`/`P`), a
+aprovação de `APPROVED_CATEGORIES` depende de revisão humana item a item da cauda
+de menor valência:
+
+```bash
+python review_negative_tail.py OASIS                    # lote de 100 itens, do mais negativo
+python review_negative_tail.py EmoMadrid --n-items 100
+python review_negative_tail.py OASIS --no-resume          # ignora o watermark, revisa do zero
+```
+
+Para cada item: `[a]`provar, `[b]`loquear, `[s]`kip (reaparece na próxima sessão) ou
+`[q]`uit. Bloqueios são gravados incrementalmente em `blocked_item_ids.txt` (colar
+depois em `BLOCKED_ITEM_IDS`) — uma sessão interrompida no meio não perde decisões
+já tomadas. Progresso por dataset fica em `review_watermark.json`, para retomar sem
+revisar o mesmo item duas vezes. **Critério de parada por dataset:** não um número
+fixo pequeno — rodar em lotes de 100 e parar quando um lote inteiro não gerar
+nenhum bloqueio (o script já sinaliza isso ao final de cada execução).
+
 ## 3. Testar
 
 ### Auditoria de normalização (`normalization.py`)
@@ -162,6 +189,33 @@ um checador de consistência interna (`run_consistency_audit`) que cruza tags, o
 declarado e quadrante (quando existir) contra o sinal de valência/arousal — foi esse
 checador que revelou que o EMOPIA tinha um valor contínuo armazenado espúrio,
 inconsistente com as próprias tags/oitante/quadrante do item.
+
+### Recaracterização estatística e calibração do guardrail (`characterize.py`)
+
+Script standalone, fora do caminho de produção — roda contra o catálogo carregado
+via `load_active_catalog()` (qualquer `DATA_BACKEND`) e produz um relatório
+estatístico do dataset real (distribuição de Valência/Arousal geral e por
+modalidade, densidade por oitante geométrico, duração por modalidade/bucket de
+tempo, sobrevivência da curadoria por dataset, confiabilidade da origem
+psychometric/heuristic, tamanho de pool na grade completa de contextos, reaudição
+de normalização e consistência interna agregada):
+
+```bash
+python characterize.py
+```
+
+Também calibra os limiares do guardrail (`calibrate_guardrail_thresholds` para
+arousal, `calibrate_valence_threshold` para valência aversiva) a partir de
+percentis da distribuição **real** do catálogo já curado — nunca herdados do
+dataset sintético. Uma calibração por percentil só é válida para a distribuição que
+ela de fato vai filtrar: **recalibrar sempre que `APPROVED_CATEGORIES` mudar**, já
+que restringir/expandir a allowlist muda a distribuição do catálogo carregado. A
+ferramenta escolhe o candidato mais protetor que ainda mantém o pool mínimo (≥
+`TOP_K` em toda a grade `curr × ALLOWED_DEST_OCTANTS × tempo`); se nenhum candidato
+atender ao piso, sinaliza para revisão manual em vez de escolher um valor
+silenciosamente inseguro. Os valores calibrados vão manualmente em
+`SAFETY_AROUSAL_THRESHOLD`/`SAFETY_AVERSIVE_VALENCE_THRESHOLD`
+(`sistema_de_recomendacao_v3.py`), como qualquer alteração de código.
 
 ### Testes de aceitação (`test_data_pipeline.py`)
 

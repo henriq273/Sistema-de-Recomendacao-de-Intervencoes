@@ -19,6 +19,12 @@ Módulos companheiros (fora deste arquivo, ver DATA_BACKEND acima):
     bloqueio por ID/revisão geométrica), chamada por data_source.load_catalog()
   - normalization.py — script standalone de auditoria dos campos
     normalizados; não faz parte do caminho de produção
+  - characterize.py — script standalone de recaracterização estatística do
+    catálogo real e calibração dos limiares do guardrail; não faz parte do
+    caminho de produção
+  - review_negative_tail.py — bancada de curadoria manual (revisão humana
+    item a item da cauda de menor valência); não faz parte do caminho de
+    produção
 """
 import json
 import math
@@ -72,17 +78,36 @@ CANDIDATE_POOL_SIZE = 12    # M itens mais próximos do ponto-alvo entram no poo
 # Guardrail de segurança
 USE_SAFETY_FILTER = True
 LOW_ENERGY_OCTANTS = (5, 6)      # Triste/Deprimido, Entediado/Cansado
-SAFETY_AROUSAL_THRESHOLD = 0.6   # itens acima disso são bloqueados nesses estados
+HIGH_ENERGY_OCTANTS = (3, 4)     # Estressado/Ansioso, Irritado/Raiva
+# AINDA NÃO CALIBRADOS contra o catálogo restrito desta branch (curadoria com
+# allowlist estrita ativa) -- ver Parte E do plano de consolidação. Valores
+# provisórios: SAFETY_AROUSAL_THRESHOLD mantém o original (calibrado sobre o
+# dataset sintético); SAFETY_AVERSIVE_VALENCE_THRESHOLD reusa SAFETY_MIN_VALENCE_REVIEW
+# como placeholder conservador. NÃO copiar -0.053/-0.390 daqui: esses números foram
+# calibrados sobre o catálogo SEM a Camada 1 de curadoria (branch exploratória,
+# allowlist desativada) -- inválidos para a distribuição restrita desta branch.
+# Recalibrar com characterize.py (calibrate_guardrail_thresholds/
+# calibrate_valence_threshold) assim que APPROVED_CATEGORIES estiver populada de
+# verdade (Parte D do plano).
+SAFETY_AROUSAL_THRESHOLD = 0.6              # itens acima disso são bloqueados (R1/R2/R3)
+SAFETY_AVERSIVE_VALENCE_THRESHOLD = -0.6    # itens abaixo disso são bloqueados (R4)
+# Destinos plausíveis para a grade de diagnóstico/calibração (characterize.py): só
+# octantes de valência não-negativa faz sentido como ALVO de uma intervenção --
+# octantes 3-6 (valência negativa) nunca são um destino terapêutico razoável. Não
+# restringe o CLI de produção (dest_oct ainda é livre 1-8 lá), só a varredura.
+ALLOWED_DEST_OCTANTS = (1, 2, 7, 8)
 
 # Fonte de dados: "csv" usa load_dataset() (dataset.csv, bancada de teste/protótipo);
 # "json_export" usa data_source.load_from_json_export() (arquivos locais gerados por
 # mongoexport --jsonArray, um por modalidade, ver JSON_EXPORT_DIR/JSON_EXPORT_PATHS --
 # sem exigir conexão nem pymongo instalado além do necessário para ler os arquivos);
-# "mongo" usa data_source.load_catalog() (banco real, read-only, conexão ao vivo). Fica
-# em "csv" por padrão porque MONGO_URI abaixo ainda é um placeholder — trocar para
-# "mongo" só depois de MONGO_URI/MONGO_DB/MONGO_COLLECTIONS apontarem para um banco real
-# e de APPROVED_CATEGORIES ter sido populada (ver data_source.py e safety.py).
-DATA_BACKEND = "csv"
+# "mongo" usa data_source.load_catalog() (banco real, read-only, conexão ao vivo).
+# "json_export": necessário para consumir o catálogo real (dbs/*.json) via
+# load_active_catalog(), e pré-requisito técnico de iter_raw_docs() -- usado por
+# characterize.py, safety.explore_taxonomy() e review_negative_tail.py, que lançam
+# exceção sobre DATA_BACKEND="csv". Trocar para "mongo" só depois de
+# MONGO_URI/MONGO_DB/MONGO_COLLECTIONS apontarem para um banco real.
+DATA_BACKEND = "json_export"  # "csv", "json_export" ou "mongo"
 
 # Conexão Mongo (somente leitura)
 MONGO_URI = "mongodb://<host>/<db>?readPreference=secondary"  # ajustar; usar usuário read-only se disponível
@@ -169,15 +194,31 @@ CONFIDENCE_TIER = {
 
 # Curadoria de segurança (vive só em código, sem alterar o banco)
 # Allowlist: só (dataset, category) explicitamente aprovados entram no catálogo.
-# Começa vazia de propósito — cresce conforme a taxonomia real é levantada e revisada
-# (ver safety.explore_taxonomy). Com o conjunto vazio, load_catalog() devolve um
+# Cresce conforme a taxonomia real é levantada e revisada (ver
+# safety.explore_taxonomy). Com o conjunto vazio, load_catalog() devolve um
 # DataFrame vazio: é o comportamento seguro por padrão, não um bug.
 # ATENÇÃO: não aprovar (EMOPIA, *) até confirmar, via
 # normalization.run_consistency_audit, que os itens de EMOPIA deixaram de ser
-# sinalizados como severos após a correção em data_source.normalize_audio_doc —
-# a allowlist vazia já bloqueia isso por padrão, mas fica documentado aqui para que
-# ninguém aprove a categoria "por engano" antes da correção estar validada.
-APPROVED_CATEGORIES = set()
+# sinalizados como severos após a correção em data_source.normalize_audio_doc.
+#
+# Estado desta branch (ver Parte D do plano de consolidação): só GAPED está
+# populado até aqui, porque é o único dataset resolvido ESTRUTURALMENTE (taxonomia
+# fixa e documentada, seis categorias: Sn/Sp/H/A negativas, N/P positivas/neutras
+# -- aprovar só N/P não depende de revisão item a item). OASIS e EmoMadrid não têm
+# taxonomia de categoria dedicada a conteúdo negativo -- aprová-los aqui SEM ANTES
+# rodar review_negative_tail.py sobre a cauda de menor valência de cada categoria
+# arriscaria aprovar itens perturbadores que a denylist de keyword e a revisão
+# geométrica (Camadas 2/3) não capturam (ver docstring de review_negative_tail.py).
+# DEAM/MuVi/MEDITATION_LOCAL/EMOPIA-corrigido: mesmo processo de triagem por
+# keyword + amostragem que falta rodar para MuVi -- também pendente.
+APPROVED_CATEGORIES = {
+    # GAPED -- proveniência: regra estrutural da taxonomia documentada do dataset
+    # (seção 4.4 do plano de consolidação), não revisão item a item. "neutral" = N,
+    # "positive" = P. NÃO aprovar animal_mistreatment (A), human_concern (H),
+    # snakes (Sn), spiders (Sp) -- são as quatro categorias negativas da taxonomia.
+    ("GAPED", "neutral"),
+    ("GAPED", "positive"),
+}
 
 # Denylist de palavras-chave, aplicada a nome/tags/category.
 SAFETY_DENYLIST_KEYWORDS = [
@@ -827,7 +868,7 @@ class Recommender:
         if len(eligible) == 0:
             return []
 
-        eligible = self._apply_safety_filter(eligible, curr_oct)
+        eligible = self._apply_safety_filter(eligible, curr_oct, dest_oct)
         pool_idx, pool_dist = self._candidate_pool(eligible, curr_oct, dest_oct)
 
         user_state = self.feature_space.user_state(curr_oct, dest_oct, time_avail)
@@ -873,21 +914,44 @@ class Recommender:
         self.fatigue.register(np.array([r["item_idx"] for r in results], dtype=int))
         return results
 
-    def _apply_safety_filter(self, eligible: np.ndarray, curr_oct: int) -> np.ndarray:
+    def _apply_safety_filter(self, eligible: np.ndarray, curr_oct: int, dest_oct: int) -> np.ndarray:
         """
-        Guardrail de segurança: bloqueia itens de alta ativação para usuários em estados
-        de baixa energia. Regra dura, independente do que a DQN aprendeu. Um DQN
-        otimiza apenas a recompensa recebida, sem noção de que recomendar atividade de
-        alta ativação física a alguém em estado depressivo pode agravar o quadro.
+        Guardrail de segurança, quatro regras. Regra dura, independente do que a DQN
+        aprendeu -- um DQN otimiza apenas a recompensa recebida, sem noção de que
+        certas recomendações podem agravar o quadro do usuário mesmo que "funcionem"
+        (gerem feedback positivo no curto prazo).
+
+          R1: baixa energia (LOW_ENERGY_OCTANTS) + item de alta ativação -> bloqueia.
+              Regra original: alta ativação física pode agravar um estado depressivo.
+          R2: alta energia/hiperativação (HIGH_ENERGY_OCTANTS) + item de alta ativação
+              -> bloqueia. A versão original só protegia baixa energia (5/6), deixando
+              estados de hiperativação (3/4, estresse/raiva) sem proteção equivalente
+              -- alta ativação também não é o que se quer oferecer a alguém já
+              hiperativado, mesmo que o destino desejado seja outro.
+          R3: destino de valência negativa (ta < 0, octante-alvo aversivo) + item de
+              alta ativação -> bloqueia. Não faz sentido dirigir alguém, com alta
+              ativação, rumo a um estado afetivo negativo.
+          R4: destino de valência positiva (tv > 0) + item muito aversivo (valência
+              abaixo de SAFETY_AVERSIVE_VALENCE_THRESHOLD) -> bloqueia. Item aversivo
+              contradiz o próprio objetivo da recomendação quando o destino é positivo.
         """
-        if not USE_SAFETY_FILTER or curr_oct not in LOW_ENERGY_OCTANTS:
+        if not USE_SAFETY_FILTER:
             return eligible
 
-        self.safety_checked += len(eligible)
-        arousal = self.df.loc[eligible, "Arousal"].to_numpy(dtype=np.float32)
-        safe = eligible[arousal <= SAFETY_AROUSAL_THRESHOLD]
-        self.safety_blocked += len(eligible) - len(safe)
+        A = self.df.loc[eligible, "Arousal"].to_numpy(dtype=np.float32)
+        V = self.df.loc[eligible, "Valencia"].to_numpy(dtype=np.float32)
+        tv, ta = OCTANT_MAP[dest_oct]
 
+        r1 = (curr_oct in LOW_ENERGY_OCTANTS) & (A > SAFETY_AROUSAL_THRESHOLD)
+        r2 = (curr_oct in HIGH_ENERGY_OCTANTS) & (A > SAFETY_AROUSAL_THRESHOLD)
+        r3 = (ta < 0) & (A > SAFETY_AROUSAL_THRESHOLD)
+        r4 = (tv > 0) & (V < SAFETY_AVERSIVE_VALENCE_THRESHOLD)
+        blocked = r1 | r2 | r3 | r4
+
+        self.safety_checked += len(eligible)
+        self.safety_blocked += int(np.sum(blocked))
+
+        safe = eligible[~blocked]
         # Nunca travar: se o filtro esvaziar o conjunto, reverter para o conjunto anterior.
         return safe if len(safe) > 0 else eligible
 
@@ -1007,7 +1071,8 @@ NUNCA deve ser usado para treinar o modelo que interage com usuários reais: tre
 e avaliar contra a mesma heurística faz o modelo apenas imitá-la, introduzindo viés
 e circularidade metodológica."""
 
-HIGH_ENERGY_OCTANTS = (3, 4)
+# HIGH_ENERGY_OCTANTS agora vive na seção de config (guardrail de segurança), usado
+# tanto pelo guardrail de produção quanto pelo simulador abaixo.
 
 
 def _simulate(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> tuple[float, int]:
@@ -1128,12 +1193,17 @@ def sanity_checks(recommender: Recommender, df: pd.DataFrame) -> None:
             changed += other != base
     print(f"[3] Listas alteradas ao mudar o oitante atual: {changed}/{total}")
 
-    # 4. Guardrail bloqueia exatamente 22 itens para oitantes de baixa energia (valor medido no dataset atual).
+    # 4. Guardrail bloqueia uma fração de itens para oitantes de baixa energia. Sem
+    # valor fixo esperado: o guardrail agora tem 4 regras (R1-R4, ver
+    # _apply_safety_filter) -- R4 (valência aversiva) adiciona bloqueios que a
+    # versão de 1 regra não tinha, então a contagem "22" antiga não se aplica mais.
     checked_before, blocked_before = recommender.safety_checked, recommender.safety_blocked
     recommender.recommend(5, 7, 120)
     checked = recommender.safety_checked - checked_before
     blocked = recommender.safety_blocked - blocked_before
-    print(f"[4] Guardrail: {blocked}/{checked} itens bloqueados para o oitante 5 (esperado: 22)")
+    print(f"[4] Guardrail: {blocked}/{checked} itens bloqueados para o oitante 5 "
+          f"(threshold arousal={SAFETY_AROUSAL_THRESHOLD:.3f}, "
+          f"threshold valência aversiva={SAFETY_AVERSIVE_VALENCE_THRESHOLD:.3f})")
 
     # 5. Duas chamadas idênticas produzem listas diferentes em fração razoável dos casos.
     trials = 20

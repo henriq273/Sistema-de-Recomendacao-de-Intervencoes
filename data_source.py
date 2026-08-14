@@ -250,9 +250,19 @@ def _to_feature_space_schema(df: pd.DataFrame) -> pd.DataFrame:
         arousal_norm), não a partir de octant_raw — o caminho de recomendação nunca
         depende dessa coluna, só da geometria (V, A) (mesmo motivo já documentado em
         nearest_octant()/distance_to_point() no núcleo do v3).
+
+    Colunas extras preservadas (dataset, tipo_modalidade, category, tags, octant_raw,
+    confidence_tier): não são consumidas por FeatureSpace/Recommender (que só olham
+    EXPECTED_COLUMNS), mas são úteis para diagnóstico/auditoria sobre o catálogo já
+    curado (ver characterize.py) -- sem elas, recaracterizar o catálogo real exigiria
+    reconstruir o catálogo bruto separadamente. octant_raw é mantido À PARTE de
+    Oitante (que continua puramente geométrico) justamente para permitir comparar
+    rótulo declarado vs. geométrico sem reintroduzir dependência do rótulo declarado
+    em nenhum caminho de produção.
     """
+    extra_cols = ["dataset", "tipo_modalidade", "category", "tags", "octant_raw", "confidence_tier"]
     if len(df) == 0:
-        return pd.DataFrame(columns=sysrec.EXPECTED_COLUMNS + ["item_id"])
+        return pd.DataFrame(columns=sysrec.EXPECTED_COLUMNS + ["item_id"] + extra_cols)
 
     out = pd.DataFrame(index=df.index)
     out["Nome"] = df["nome"]
@@ -270,6 +280,11 @@ def _to_feature_space_schema(df: pd.DataFrame) -> pd.DataFrame:
         sysrec.nearest_octant(v, a) for v, a in zip(out["Valencia"], out["Arousal"])
     ]
     out["item_id"] = df["item_id"]  # preservado para rastreio (BLOCKED_ITEM_IDS, logs)
+
+    # Colunas de diagnóstico, não usadas por FeatureSpace/Recommender -- ver docstring.
+    for col in extra_cols:
+        out[col] = df[col]
+
     return out.reset_index(drop=True)
 
 

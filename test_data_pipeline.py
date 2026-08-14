@@ -20,9 +20,11 @@ import os
 import re
 import sys
 import tempfile
+import types
 from contextlib import redirect_stdout
 
 import numpy as np
+import pandas as pd
 
 import data_source
 import safety
@@ -240,6 +242,96 @@ def test_approved_category_filters_correctly():
         "descartes reportados por motivo (va_ausente)",
         "va_ausente=2" in output,
         f"saída: {output.strip().splitlines()[-1] if output else '(vazia)'}",
+    )
+
+
+def test_feature_space_schema_retains_diagnostic_columns():
+    """Recaracterização estatística (characterize.py) precisa de colunas do esquema
+    unificado (dataset, tipo_modalidade, category, tags, octant_raw, confidence_tier)
+    além de EXPECTED_COLUMNS -- ver data_source._to_feature_space_schema. Confirma
+    também que FeatureSpace(catalog) não lança exceção sobre o catálogo já adaptado
+    (pré-requisito bloqueante do plano de recaracterização). Allowlist é sempre
+    estrita nesta branch (sem flag) -- popula APPROVED_CATEGORIES para o catálogo
+    não sair vazio, senão a checagem de colunas não teria o que checar."""
+    sysrec.APPROVED_CATEGORIES.clear()
+    sysrec.APPROVED_CATEGORIES.update({
+        ("OASIS", "nature"), ("DEAM", "ambient"), ("EMOPIA", "music_energetic"),
+    })
+    sysrec.BLOCKED_ITEM_IDS.clear()
+    _fake_mongo_backend(video=DOCS_VIDEO, audio=DOCS_AUDIO, image=DOCS_IMAGE)
+
+    catalog = data_source.load_catalog()
+
+    expected_extra = {
+        "dataset", "tipo_modalidade", "category", "tags", "octant_raw", "confidence_tier",
+    }
+    _check(
+        "catálogo adaptado preserva colunas de diagnóstico além de EXPECTED_COLUMNS",
+        expected_extra.issubset(set(catalog.columns)),
+        f"colunas: {sorted(catalog.columns)}",
+    )
+
+    try:
+        sysrec.FeatureSpace(catalog)
+        ok = True
+    except Exception as exc:  # não deveria lançar
+        ok = False
+        print(f"      exceção inesperada: {exc!r}")
+    _check("FeatureSpace(catalog) não lança exceção sobre o catálogo real adaptado", ok)
+
+
+def _make_safety_filter_df(arousals, valencias) -> pd.DataFrame:
+    n = len(arousals)
+    return pd.DataFrame({
+        "Nome": [f"item{i}" for i in range(n)],
+        "Tipo": ["Áudio"] * n,
+        "Valencia": valencias,
+        "Arousal": arousals,
+        "Duracao": [5.0] * n,
+        "Indoor": [0] * n,
+        "Tag": ["x"] * n,
+        "Oitante": [1] * n,
+    })
+
+
+def test_safety_filter_r2_blocks_high_energy_octant():
+    """R2 (nova regra, expandindo o guardrail): item de alta ativação é bloqueado
+    quando curr_oct está em HIGH_ENERGY_OCTANTS -- a versão anterior só cobria
+    LOW_ENERGY_OCTANTS (R1), deixando hiperativação (3/4) sem proteção equivalente.
+    dest_oct=1 (Excitado/Eufórico, ta=0.8>=0 e tv=0.8>0) é escolhido para não
+    acionar R3 (precisa ta<0) nem R4 (precisa Valencia abaixo do limiar aversivo)."""
+    df = _make_safety_filter_df(
+        arousals=[sysrec.SAFETY_AROUSAL_THRESHOLD - 0.1, sysrec.SAFETY_AROUSAL_THRESHOLD + 0.1],
+        valencias=[0.1, 0.1],
+    )
+    fake_self = types.SimpleNamespace(df=df, safety_checked=0, safety_blocked=0)
+    eligible = df.index.to_numpy()
+
+    safe = sysrec.Recommender._apply_safety_filter(fake_self, eligible, curr_oct=3, dest_oct=1)
+
+    _check(
+        "R2: item de alta ativação bloqueado quando curr_oct=3 (HIGH_ENERGY_OCTANTS)",
+        0 in safe and 1 not in safe,
+        f"eligible={list(eligible)} safe={list(safe)}",
+    )
+
+
+def test_safety_filter_never_empties_eligible():
+    """Garantia mantida do guardrail original: se o filtro bloquearia TODOS os itens
+    elegíveis, reverte para o conjunto anterior em vez de esvaziar."""
+    df = _make_safety_filter_df(
+        arousals=[sysrec.SAFETY_AROUSAL_THRESHOLD + 0.1] * 2, valencias=[0.1, 0.1],
+    )
+    fake_self = types.SimpleNamespace(df=df, safety_checked=0, safety_blocked=0)
+    eligible = df.index.to_numpy()
+
+    # curr_oct=5 (LOW_ENERGY_OCTANTS) + dest_oct=1 -> R1 bloquearia os dois únicos itens.
+    safe = sysrec.Recommender._apply_safety_filter(fake_self, eligible, curr_oct=5, dest_oct=1)
+
+    _check(
+        "guardrail nunca esvazia o conjunto elegível mesmo quando tudo seria bloqueado",
+        len(safe) == len(eligible),
+        f"safe={list(safe)}",
     )
 
 
@@ -645,6 +737,9 @@ def main() -> None:
     test_pymongo_import_is_local_not_module_level()
     test_empty_allowlist_returns_empty_catalog()
     test_approved_category_filters_correctly()
+    test_feature_space_schema_retains_diagnostic_columns()
+    test_safety_filter_r2_blocks_high_energy_octant()
+    test_safety_filter_never_empties_eligible()
     test_extract_emopia_quadrant()
     test_scale_none_is_skipped_generically()
     test_emomadrid_scale_confirmed_by_example()
