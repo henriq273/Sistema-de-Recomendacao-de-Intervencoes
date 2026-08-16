@@ -3,15 +3,15 @@ Remove dados residuais gerados por execuções/testes do sistema de recomendaç�
 checkpoint(s) do agente (checkpoint*.pt), log de interações (interaction_log.jsonl)
 e, opcionalmente, caches de bytecode (__pycache__).
 
-Por padrão roda em modo dry-run (só lista o que seria removido). Passe --confirmar
+Por padrão roda em modo dry-run (só lista o que seria removido). Passe --confirm
 para remover de fato — mesmo padrão do `git clean -n` / `git clean -f`.
 
 Uso:
     python clear.py                        # dry-run: só mostra o que seria removido
-    python clear.py --confirmar             # remove checkpoint(s) e log de interações
-    python clear.py --confirmar --cache      # também remove __pycache__
-    python clear.py --confirmar --manter-log # remove só o(s) checkpoint(s)
-    python clear.py --confirmar --extra foo.pt bar.jsonl  # remove arquivos extras também
+    python clear.py --confirm               # remove checkpoint(s) e log de interações
+    python clear.py --confirm --cache        # também remove __pycache__
+    python clear.py --confirm --manter-log   # remove só o(s) checkpoint(s)
+    python clear.py --confirm --extra foo.pt bar.jsonl  # remove arquivos extras também
 """
 import argparse
 import glob
@@ -77,7 +77,7 @@ def main() -> None:
         description="Remove dados residuais de execuções/testes do sistema de recomendação.",
     )
     parser.add_argument(
-        "--confirmar", action="store_true",
+        "--confirm", action="store_true",
         help="Remove de fato. Sem esta flag, só mostra o que seria removido (dry-run).",
     )
     parser.add_argument("--manter-checkpoint", action="store_true", help="Não remove checkpoint*.pt.")
@@ -109,8 +109,8 @@ def main() -> None:
         rel = os.path.relpath(path, REPO_DIR)
         print(f"  [{kind}] {rel}")
 
-    if not args.confirmar:
-        print(f"\n{len(targets)} item(ns) seriam removidos. Rode com --confirmar para remover de fato.")
+    if not args.confirm:
+        print(f"\n{len(targets)} item(ns) seriam removidos. Rode com --confirm para remover de fato.")
         return
 
     for _, path in targets:

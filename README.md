@@ -263,7 +263,7 @@ opção de não executar nenhuma intervenção (sem aprendizado nessa rodada).
 
 ```bash
 python clear.py                    # dry-run
-python clear.py --confirmar         # remove checkpoint*.pt e interaction_log*.jsonl
-python clear.py --confirmar --cache  # também remove __pycache__
+python clear.py --confirm           # remove checkpoint*.pt e interaction_log*.jsonl
+python clear.py --confirm --cache    # também remove __pycache__
 python clear.py --help              # demais opções (--manter-log, --manter-checkpoint, --extra)
 ```
