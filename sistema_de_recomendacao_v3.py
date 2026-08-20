@@ -25,6 +25,9 @@ Módulos companheiros (fora deste arquivo, ver DATA_BACKEND acima):
   - review_negative_tail.py — bancada de curadoria manual (revisão humana
     item a item da cauda de menor valência); não faz parte do caminho de
     produção
+  - fatigue_diagnostics.py — bancada de diagnóstico do espaçamento de
+    recomendações (gaps entre reaparições do mesmo item); não faz parte do
+    caminho de produção
 """
 import json
 import math
@@ -74,6 +77,12 @@ ISO_ALPHA = 1.0
 
 # Conjunto de candidatos
 CANDIDATE_POOL_SIZE = 12    # M itens mais próximos do ponto-alvo entram no pool
+
+# --- Filtro por tempo disponível: EM STAND-BY ---
+# Motivo: [preencher com a razão do projeto]. O filtro e a pergunta continuam no
+# código, desativados por esta flag -- reativar trocando para True, sem precisar
+# restaurar nada manualmente.
+TIME_FILTER_ENABLED = False
 
 # Guardrail de segurança
 USE_SAFETY_FILTER = True
@@ -287,6 +296,17 @@ P_EXPLORE_SLOT = 0.5        # probabilidade de um dos slots ser exploratório
 MMR_LAMBDA = 0.7            # 0.7*relevância - 0.3*similaridade (diversidade da lista)
 FATIGUE_LAMBDA = 0.5        # peso máximo da penalidade de fadiga
 FATIGUE_HALFLIFE = 10       # em nº de interações; meia-vida do decaimento da penalidade
+# Nº mínimo de interações antes de um item poder reaparecer (bloqueio RÍGIDO,
+# aplicado no pool antes da pontuação -- ver FatigueTracker.blocked_mask). A
+# penalidade suave acima (FATIGUE_LAMBDA/FATIGUE_HALFLIFE) nunca garante espaçamento
+# por construção: fatigue_diagnostics.py mediu, contra o catálogo real, que em 0%
+# dos contextos a penalidade máxima sequer supera o gap de score real entre 1º e 2º
+# colocado -- ou seja, ela nunca tem força para trocar o item escolhido, e o mesmo
+# item reaparecia na interação imediatamente seguinte em 32.5% dos casos (contexto
+# fixo, pior caso). Ex.: item mostrado na interação t -> bloqueado em t+1 e t+2
+# (delta=1,2) -> elegível de novo a partir de t+3 (delta=3), ainda com a penalidade
+# suave decrescente por cima.
+FATIGUE_MIN_GAP = 3
 TOP_K = 3                   # itens recomendados por vez
 
 # Persistência - conservar pesos, histórico de treino e log de interações
@@ -800,13 +820,31 @@ exibir. Nada aqui altera pesos, gradientes ou o que o modelo aprende.
 O treino (Agent.replay()) continua enxergando os Q-values puros."""
 
 class FatigueTracker:
-    # Penaliza itens recomendados recentemente, para evitar repetição e monotonia.
+    """Espaçamento de recomendações: bloqueio RÍGIDO dos FATIGUE_MIN_GAP primeiros
+    deltas (blocked_mask, aplicado no pool antes da pontuação) + penalidade suave
+    decrescente por cima, para itens que já passaram do bloqueio (penalty, aplicada
+    depois da pontuação). O bloqueio garante o intervalo mínimo por construção; a
+    penalidade sozinha não garante (ver FATIGUE_MIN_GAP e fatigue_diagnostics.py)."""
 
     def __init__(self):
         self.last_seen: dict[int, int] = {}
         self.counter = 0
 
+    def blocked_mask(self, item_indices: np.ndarray) -> np.ndarray:
+        """Bloqueio RÍGIDO: item mostrado há menos de FATIGUE_MIN_GAP interações
+        não entra no pool de seleção. Diferente de penalty() -- que só desestimula
+        sem garantir espaçamento -- isto garante o intervalo mínimo."""
+        blocked = np.zeros(len(item_indices), dtype=bool)
+        for i, item_idx in enumerate(item_indices):
+            if item_idx in self.last_seen:
+                delta = self.counter - self.last_seen[item_idx]
+                blocked[i] = delta < FATIGUE_MIN_GAP
+        return blocked
+
     def penalty(self, item_indices: np.ndarray) -> np.ndarray:
+        """Penalidade suave -- agora só relevante para itens que já passaram do
+        bloqueio rígido (delta >= FATIGUE_MIN_GAP), continuando a desestimular
+        gradualmente em vez de liberar em força total assim que o bloqueio termina."""
         penalties = np.zeros(len(item_indices), dtype=np.float32)
         for i, item_idx in enumerate(item_indices):
             if item_idx in self.last_seen:
@@ -864,12 +902,25 @@ class Recommender:
         return len(self.recommended_items) / len(self.df)
 
     def recommend(self, curr_oct: int, dest_oct: int, time_avail: float, k: int = TOP_K) -> list[dict]:
-        eligible = self.df.index[self.df["Duracao"] <= time_avail].to_numpy(dtype=int)
+        if TIME_FILTER_ENABLED:
+            eligible = self.df.index[self.df["Duracao"] <= time_avail].to_numpy(dtype=int)
+        else:
+            # Filtro por tempo desativado (ver TIME_FILTER_ENABLED) -- todos os
+            # itens do catálogo são elegíveis por duração nesta versão.
+            eligible = self.df.index.to_numpy(dtype=int)
         if len(eligible) == 0:
             return []
 
         eligible = self._apply_safety_filter(eligible, curr_oct, dest_oct)
         pool_idx, pool_dist = self._candidate_pool(eligible, curr_oct, dest_oct)
+
+        # Bloqueio rígido de fadiga: remove do pool itens mostrados há menos de
+        # FATIGUE_MIN_GAP interações. Nunca esvazia o pool -- mesma garantia dos
+        # demais filtros (guardrail, curadoria): se o bloqueio deixaria o pool
+        # vazio, reverte.
+        fatigue_blocked = self.fatigue.blocked_mask(pool_idx)
+        if fatigue_blocked.any() and not fatigue_blocked.all():
+            pool_idx, pool_dist = pool_idx[~fatigue_blocked], pool_dist[~fatigue_blocked]
 
         user_state = self.feature_space.user_state(curr_oct, dest_oct, time_avail)
         q_dist = self.agent.q_distribution(user_state, pool_idx)
@@ -1468,7 +1519,12 @@ def _run_interaction(recommender: Recommender, agent: Agent, feature_space: Feat
     try:
         curr_oct = _read_octant("Oitante atual (1-8): ")
         dest_oct = _read_octant("Oitante desejado (1-8): ")
-        time_avail = _read_time("Tempo disponível (1-120 minutos): ")
+        if TIME_FILTER_ENABLED:
+            time_avail = _read_time("Tempo disponível (1-120 minutos): ")
+        else:
+            # Tempo "pleno" -- mantém o vetor de estado do usuário bem definido
+            # (normaliza para 1.0) mesmo sem perguntar/filtrar por duração.
+            time_avail = feature_space.max_duration
     except KeyboardInterrupt:
         return False
 

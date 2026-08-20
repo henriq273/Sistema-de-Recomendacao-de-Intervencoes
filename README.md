@@ -23,8 +23,9 @@ Todo o núcleo do sistema (config, features, agente, política de recomendação
 em `sistema_de_recomendacao_v3.py`. Os módulos `data_source.py`, `safety.py` e
 `normalization.py` são companheiros, usados quando a fonte de dados é um catálogo real
 (export JSON local ou MongoDB ao vivo) em vez do `dataset.csv` sintético.
-`characterize.py` e `review_negative_tail.py` são bancadas de diagnóstico/curadoria
-manual, fora do caminho de produção (ver seções 2 e 3 abaixo).
+`characterize.py`, `review_negative_tail.py` e `fatigue_diagnostics.py` são bancadas
+de diagnóstico/curadoria manual, fora do caminho de produção (ver seções 2 e 3
+abaixo).
 
 ## Requisitos
 
@@ -217,6 +218,29 @@ silenciosamente inseguro. Os valores calibrados vão manualmente em
 `SAFETY_AROUSAL_THRESHOLD`/`SAFETY_AVERSIVE_VALENCE_THRESHOLD`
 (`sistema_de_recomendacao_v3.py`), como qualquer alteração de código.
 
+### Diagnóstico de espaçamento de recomendações (`fatigue_diagnostics.py`)
+
+Script standalone, fora do caminho de produção — mede o comportamento real de
+espaçamento entre reaparições do mesmo item (gaps), tanto em um contexto fixo
+repetido (pior caso) quanto em contextos variados (caso médio), e compara a
+penalidade suave de fadiga (`FATIGUE_LAMBDA`/`FATIGUE_HALFLIFE`) contra o gap real
+de score entre o 1º e o 2º colocado do pool — responde se a penalidade suave tem,
+sequer em tese, força para trocar o item escolhido:
+
+```bash
+python fatigue_diagnostics.py
+```
+
+Foi rodando este script que se confirmou (contra o catálogo real) que a penalidade
+suave sozinha nunca garantia espaçamento: em 0% dos contextos ela superava o gap de
+score real, e o mesmo item reaparecia na interação imediatamente seguinte em ~33%
+dos casos no pior cenário. Por isso `FatigueTracker` tem um bloqueio **rígido**
+(`FATIGUE_MIN_GAP`, nº mínimo de interações antes de um item poder reaparecer,
+aplicado no pool antes da pontuação) além da penalidade suave (que continua atuando
+sobre os itens já liberados do bloqueio). Rodar este script de novo depois de mudar
+`FATIGUE_MIN_GAP`/`CANDIDATE_POOL_SIZE` confirma que nenhum gap abaixo do mínimo
+configurado aparece mais, e que o pool não ficou degenerado em nenhum contexto.
+
 ### Testes de aceitação (`test_data_pipeline.py`)
 
 Cobre `data_source.py`/`safety.py`/`normalization.py` de ponta a ponta com uma
@@ -255,6 +279,20 @@ main(dataset_path="/content/drive/MyDrive/.../dataset.csv")
 
 A cada recomendação, o feedback é dado em 5 níveis (muito ruim -> muito bom), mais a
 opção de não executar nenhuma intervenção (sem aprendizado nessa rodada).
+
+**Filtro por tempo disponível — EM STAND-BY (`TIME_FILTER_ENABLED = False`).** O CLI
+não pergunta mais o tempo disponível, e `recommend()` não filtra mais por `Duracao`
+nesta versão. O filtro e a pergunta continuam no código, só desativados por essa
+flag — reativar trocando `TIME_FILTER_ENABLED` para `True` em
+`sistema_de_recomendacao_v3.py`, sem precisar restaurar nada manualmente.
+
+**Espaçamento de recomendações (`FATIGUE_MIN_GAP = 3`).** Além da penalidade suave
+de fadiga (que só desestimula, nunca garante espaçamento — ver
+`fatigue_diagnostics.py` acima), um item mostrado não pode reaparecer nas
+`FATIGUE_MIN_GAP` interações seguintes (bloqueio rígido, aplicado no pool antes da
+pontuação). Ajustar `FATIGUE_MIN_GAP` em `sistema_de_recomendacao_v3.py`; valores
+muito altos frente a `CANDIDATE_POOL_SIZE` podem degenerar o pool em catálogos
+pequenos ou pouco diversos — reconfirmar com `fatigue_diagnostics.py` depois de mudar.
 
 ## Limpeza de dados residuais
 

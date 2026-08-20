@@ -732,6 +732,91 @@ def test_iter_raw_docs_json_export_dataset_filter_case_insensitive():
             sysrec.DATA_BACKEND = original_backend
 
 
+def _build_tiny_recommender(n_items: int = 4):
+    """Catálogo sintético mínimo (EXPECTED_COLUMNS) + FeatureSpace/Agent/Recommender
+    reais -- usado pelos testes de fadiga/filtro de tempo, que precisam exercitar
+    Recommender.recommend() de ponta a ponta, não só funções isoladas."""
+    df = pd.DataFrame({
+        "Nome": [f"item{i}" for i in range(n_items)],
+        "Tipo": ["Áudio"] * n_items,
+        "Valencia": [0.1 * i for i in range(n_items)],
+        "Arousal": [-0.1 * i for i in range(n_items)],
+        "Duracao": [5.0] * n_items,
+        "Indoor": [0] * n_items,
+        "Tag": ["x"] * n_items,
+        "Oitante": [1] * n_items,
+    })
+    feature_space = sysrec.FeatureSpace(df)
+    agent = sysrec.Agent(df, feature_space)
+    recommender = sysrec.Recommender(df, feature_space, agent)
+    return recommender, df
+
+
+def test_fatigue_blocked_mask_correctness():
+    """FatigueTracker.blocked_mask bloqueia exatamente os itens com
+    delta < FATIGUE_MIN_GAP desde a última aparição, e libera os demais."""
+    tracker = sysrec.FatigueTracker()
+    tracker.register(np.array([10]))   # item 10 visto no counter=0; counter vira 1
+    tracker.register(np.array([20]))   # item 20 visto no counter=1; counter vira 2
+
+    # counter agora é 2: delta(10)=2-0=2, delta(20)=2-1=1, delta(30)=nunca visto.
+    mask = tracker.blocked_mask(np.array([10, 20, 30]))
+    expected = np.array([2 < sysrec.FATIGUE_MIN_GAP, 1 < sysrec.FATIGUE_MIN_GAP, False])
+    _check(
+        "FatigueTracker.blocked_mask bloqueia deltas < FATIGUE_MIN_GAP e libera o resto",
+        np.array_equal(mask, expected),
+        f"mask={mask} expected={expected}",
+    )
+
+
+def test_fatigue_never_empties_pool():
+    """Garantia da Parte 2: se TODOS os itens do pool foram mostrados há menos de
+    FATIGUE_MIN_GAP interações, o bloqueio rígido não pode esvaziar o pool -- o
+    Recommender reverte para o pool anterior (mesma regra do guardrail/curadoria)."""
+    recommender, df = _build_tiny_recommender(n_items=4)
+
+    # Força TODOS os itens do catálogo como "recém-mostrados" (delta=1 < FATIGUE_MIN_GAP).
+    recommender.fatigue.register(df.index.to_numpy())
+
+    results = recommender.recommend(curr_oct=1, dest_oct=1, time_avail=60, k=2)
+    _check(
+        "fadiga nunca esvazia o pool: recommend() ainda devolve itens mesmo com "
+        "todo o catálogo 'recém-mostrado'",
+        len(results) > 0,
+        f"results={results}",
+    )
+
+
+def test_time_filter_toggle():
+    """Testes 5 e 6: com TIME_FILTER_ENABLED=False (padrão), recommend() ignora
+    Duracao (mesmo pedindo bem menos tempo do que qualquer item exige); com True,
+    volta a filtrar -- regressão zero quando reativado."""
+    recommender, df = _build_tiny_recommender(n_items=3)
+    # Todos os itens têm Duracao=5.0 -- time_avail=1 exclui todos SE o filtro estiver ativo.
+
+    original = sysrec.TIME_FILTER_ENABLED
+    try:
+        sysrec.TIME_FILTER_ENABLED = False
+        results_disabled = recommender.recommend(curr_oct=1, dest_oct=1, time_avail=1, k=2)
+        _check(
+            "TIME_FILTER_ENABLED=False: recommend() ignora Duracao "
+            "(devolve itens mesmo com time_avail menor que qualquer duração do catálogo)",
+            len(results_disabled) > 0,
+            f"results={results_disabled}",
+        )
+
+        sysrec.TIME_FILTER_ENABLED = True
+        results_enabled = recommender.recommend(curr_oct=1, dest_oct=1, time_avail=1, k=2)
+        _check(
+            "TIME_FILTER_ENABLED=True: recommend() volta a filtrar por Duracao "
+            "(nenhum item cabe em time_avail=1 -- lista vazia, comportamento pré-flag)",
+            results_enabled == [],
+            f"results={results_enabled}",
+        )
+    finally:
+        sysrec.TIME_FILTER_ENABLED = original
+
+
 def main() -> None:
     test_write_methods_absent()
     test_pymongo_import_is_local_not_module_level()
@@ -740,6 +825,9 @@ def main() -> None:
     test_feature_space_schema_retains_diagnostic_columns()
     test_safety_filter_r2_blocks_high_energy_octant()
     test_safety_filter_never_empties_eligible()
+    test_fatigue_blocked_mask_correctness()
+    test_fatigue_never_empties_pool()
+    test_time_filter_toggle()
     test_extract_emopia_quadrant()
     test_scale_none_is_skipped_generically()
     test_emomadrid_scale_confirmed_by_example()
