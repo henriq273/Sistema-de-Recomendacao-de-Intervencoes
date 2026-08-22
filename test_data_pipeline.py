@@ -732,15 +732,18 @@ def test_iter_raw_docs_json_export_dataset_filter_case_insensitive():
             sysrec.DATA_BACKEND = original_backend
 
 
-def _build_tiny_recommender(n_items: int = 4):
+def _build_tiny_recommender(n_items: int = 4, valencia: list = None, arousal: list = None):
     """Catálogo sintético mínimo (EXPECTED_COLUMNS) + FeatureSpace/Agent/Recommender
-    reais -- usado pelos testes de fadiga/filtro de tempo, que precisam exercitar
-    Recommender.recommend() de ponta a ponta, não só funções isoladas."""
+    reais -- usado pelos testes de fadiga/filtro de tempo/determinismo do slot 1,
+    que precisam exercitar Recommender.recommend() de ponta a ponta, não só funções
+    isoladas. `valencia`/`arousal` são opcionais -- por padrão usam a progressão
+    linear original; passe valores explícitos quando o teste precisar de um
+    ranking de score conhecido e sem empates."""
     df = pd.DataFrame({
         "Nome": [f"item{i}" for i in range(n_items)],
         "Tipo": ["Áudio"] * n_items,
-        "Valencia": [0.1 * i for i in range(n_items)],
-        "Arousal": [-0.1 * i for i in range(n_items)],
+        "Valencia": valencia if valencia is not None else [0.1 * i for i in range(n_items)],
+        "Arousal": arousal if arousal is not None else [-0.1 * i for i in range(n_items)],
         "Duracao": [5.0] * n_items,
         "Indoor": [0] * n_items,
         "Tag": ["x"] * n_items,
@@ -817,6 +820,102 @@ def test_time_filter_toggle():
         sysrec.TIME_FILTER_ENABLED = original
 
 
+def test_select_slots_slot1_always_greedy_argmax():
+    """Requisito central: o slot 1 deve ser SEMPRE o item de maior `adjusted`
+    score, de forma determinística -- nunca sorteado, mesmo quando o slot
+    exploratório entra em jogo (P_EXPLORE_SLOT) ou quando a cauda é embaralhada.
+    _select_slots não lê nada de `self` -- testável isoladamente como função pura,
+    sem Agent/FeatureSpace reais (mesmo padrão de self falso já usado para
+    _apply_safety_filter)."""
+    fake_self = types.SimpleNamespace()
+    adjusted = np.array([0.1, 0.9, 0.3, 0.5], dtype=np.float32)  # posição 1 = argmax, sem empate
+    pool_vectors = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]])
+    true_best = int(np.argmax(adjusted))
+
+    violations = []
+    for _ in range(200):
+        chosen, slot_types, propensities = sysrec.Recommender._select_slots(
+            fake_self, adjusted, pool_vectors, k=3
+        )
+        if chosen[0] != true_best or slot_types[0] != "greedy" or propensities[0] != 1.0:
+            violations.append((chosen, slot_types, propensities))
+
+    _check(
+        "slot 1 é sempre o argmax determinístico de `adjusted` em 200 chamadas "
+        "(cobrindo o sorteio do slot exploratório e o embaralhamento da cauda) -- "
+        "nunca sorteado, sempre slot_type='greedy' e propensão 1.0",
+        violations == [],
+        f"{len(violations)}/200 violações; exemplos: {violations[:3]}",
+    )
+
+
+def test_slot1_deterministic_and_respects_fatigue_spacing():
+    """Prova de ponta a ponta (recommend() completo) das duas metades do
+    requisito juntas:
+      (a) slot 1 nunca tem score menor que os demais slots retornados na mesma
+          chamada (condição necessária de ser o item de maior score do pool);
+      (b) o espaçamento (FATIGUE_MIN_GAP) continua valendo: nenhum item reaparece
+          no slot 1 com intervalo menor que FATIGUE_MIN_GAP chamadas consecutivas
+          no MESMO contexto.
+
+    Catálogo dimensionado com folga -- (FATIGUE_MIN_GAP + 1) * TOP_K itens -- para
+    que o fallback de "nunca esvaziar o pool" do FatigueTracker nunca precise
+    disparar: com poucos itens, esse fallback (que reverte a filtragem quando ela
+    zeraria o pool) pode reintroduzir um item ainda em cooldown, invalidando a
+    garantia de espaçamento por escassez de catálogo, não por regressão real. No
+    pior caso, até 2*TOP_K itens ficam em cooldown simultaneamente (os mostrados
+    nas duas chamadas anteriores); (FATIGUE_MIN_GAP+1)*TOP_K garante sempre pelo
+    menos TOP_K itens livres. (Valencia, Arousal) em progressão linear até
+    (0.8, 0.8) = centroide do octante 1 (ISO_ALPHA=1.0) -- distâncias únicas, sem
+    empate, então o ranking geométrico é conhecido: item0 (distância 0) é o argmax
+    inequívoco na 1ª chamada."""
+    n_items = (sysrec.FATIGUE_MIN_GAP + 1) * sysrec.TOP_K
+    valencia = [0.8 - 0.05 * i for i in range(n_items)]
+    arousal = [0.8 - 0.05 * i for i in range(n_items)]
+    recommender, df = _build_tiny_recommender(n_items=n_items, valencia=valencia, arousal=arousal)
+
+    n_calls = sysrec.FATIGUE_MIN_GAP + 3
+    slot1_history = []
+    necessary_condition_ok = True
+    for _ in range(n_calls):
+        results = recommender.recommend(curr_oct=1, dest_oct=1, time_avail=60, k=sysrec.TOP_K)
+        if not results:
+            necessary_condition_ok = False
+            break
+        slot1_history.append(results[0]["item_idx"])
+        if len(results) > 1 and results[0]["score"] < max(r["score"] for r in results[1:]):
+            necessary_condition_ok = False
+
+    _check(
+        "primeira chamada: slot 1 é o item geometricamente mais próximo do alvo "
+        "(distância 0 a (0.8,0.8)) -- argmax inequívoco do catálogo sintético",
+        bool(slot1_history) and slot1_history[0] == 0,
+        f"slot1_history={slot1_history}",
+    )
+    _check(
+        "slot 1 nunca tem score menor que os demais slots retornados na mesma "
+        "chamada (condição necessária de ser sempre o item de maior score do pool)",
+        necessary_condition_ok,
+        f"slot1_history={slot1_history}",
+    )
+
+    last_seen_at = {}
+    min_gap_seen = None
+    for call_idx, item_idx in enumerate(slot1_history):
+        if item_idx in last_seen_at:
+            gap = call_idx - last_seen_at[item_idx]
+            min_gap_seen = gap if min_gap_seen is None else min(min_gap_seen, gap)
+        last_seen_at[item_idx] = call_idx
+
+    _check(
+        f"espaçamento preservado: nenhum item reaparece no slot 1 com intervalo "
+        f"menor que FATIGUE_MIN_GAP={sysrec.FATIGUE_MIN_GAP} chamadas consecutivas "
+        f"com o MESMO contexto",
+        min_gap_seen is None or min_gap_seen >= sysrec.FATIGUE_MIN_GAP,
+        f"slot1_history={slot1_history} min_gap_seen={min_gap_seen}",
+    )
+
+
 def main() -> None:
     test_write_methods_absent()
     test_pymongo_import_is_local_not_module_level()
@@ -828,6 +927,8 @@ def main() -> None:
     test_fatigue_blocked_mask_correctness()
     test_fatigue_never_empties_pool()
     test_time_filter_toggle()
+    test_select_slots_slot1_always_greedy_argmax()
+    test_slot1_deterministic_and_respects_fatigue_spacing()
     test_extract_emopia_quadrant()
     test_scale_none_is_skipped_generically()
     test_emomadrid_scale_confirmed_by_example()

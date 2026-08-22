@@ -289,8 +289,9 @@ def feedback_level_to_reward(level: int) -> float:
     return REWARD_SUPPORT[level - 1]
 
 
-# Anti-monotonia
-SOFTMAX_TEMPERATURE = 0.3   # temperatura do sorteio do slot 1 (menor = mais guloso)
+# Anti-monotonia (agora só nos slots 2/3 -- o slot 1 é sempre o argmax
+# determinístico do score; ver Recommender._select_slots). SOFTMAX_TEMPERATURE foi
+# removida: não há mais sorteio no slot 1.
 EXPLORE_TEMPERATURE = 1.0   # temperatura do slot exploratório (maior = mais diverso)
 P_EXPLORE_SLOT = 0.5        # probabilidade de um dos slots ser exploratório
 MMR_LAMBDA = 0.7            # 0.7*relevância - 0.3*similaridade (diversidade da lista)
@@ -958,7 +959,7 @@ class Recommender:
                 "p_muito_ruim": float(q_dist[pos, 0]),   # P(nível 1 = muito ruim), usado no guardrail probabilístico
                 "score": float(adjusted[pos]),           # score híbrido pós-fadiga e pós-risco
                 "propensity": propensity,                # π(a|x) para avaliação off-policy
-                "slot_type": slot_type,                  # "softmax" | "explore" | "mmr"
+                "slot_type": slot_type,                  # "greedy" | "explore" | "mmr"
             })
             self.recommended_items.add(item_idx)
 
@@ -1058,27 +1059,45 @@ class Recommender:
 
     def _select_slots(self, adjusted: np.ndarray, pool_vectors: np.ndarray, k: int):
         """
-        Slot 1: amostragem estocástica por softmax, para que o "melhor" item varie entre
-        interações em vez de ser sempre o argmax. Slot exploratório (opcional): softmax
-        com temperatura mais alta sobre o restante, em posição sorteada na lista final
-        (não previsível ao usuário). Slots restantes: MMR (Maximal Marginal Relevance),
-        para garantir que as opções sejam qualitativamente distintas entre si.
+        Slot 1: SEMPRE o argmax determinístico de `adjusted` -- o item de maior score
+        pós-fadiga/risco no pool atual, inclusive durante rodadas de exploração. Nunca
+        é sorteado. O espaçamento de recomendações (FATIGUE_MIN_GAP) já está garantido
+        ANTES desta função rodar: FatigueTracker.blocked_mask remove do pool, em
+        Recommender.recommend(), qualquer item mostrado há menos de FATIGUE_MIN_GAP
+        interações -- logo o item que "vence" o argmax aqui já não pode ser um item
+        recém-mostrado; assim que o antigo 1º colocado é bloqueado, o argmax passa
+        automaticamente para o próximo melhor item elegível. Esta função não
+        reimplementa esse bloqueio, só herda o efeito dele.
 
-        Retorna (posições no pool, tipo de cada slot, propensão de cada slot). A
-        propensão é exata para os slots sorteados e 1.0 para os slots determinísticos
-        do MMR, condicionados aos sorteios anteriores. O campo slot_type permite que a
-        análise off-policy futura (IPS/SNIPS/Doubly Robust) decida quais registros usar.
+        Slot exploratório (opcional, só entre os slots restantes após remover o slot
+        1): softmax com temperatura mais alta sobre o que sobrou do pool -- nunca
+        compete pelo 1º lugar. Slots restantes: MMR (Maximal Marginal Relevance), para
+        garantir que as opções sejam qualitativamente distintas entre si. A posição do
+        slot exploratório dentro da lista final (posições 2..k) é sorteada -- não
+        previsível ao usuário --, mas o slot 1 NUNCA participa desse sorteio de
+        posição: fica sempre fixo na posição 0.
+
+        Retorna (posições no pool, tipo de cada slot, propensão de cada slot). O slot 1
+        tem slot_type="greedy" e propensão 1.0 (escolha determinística, sem
+        amostragem -- mesma convenção já usada para os slots "mmr", também
+        determinísticos condicionados às escolhas anteriores). A propensão é exata
+        (< 1.0) apenas para o slot "explore", o único de fato sorteado. O campo
+        slot_type permite que a análise off-policy futura (IPS/SNIPS/Doubly Robust)
+        decida quais registros usar -- registros "greedy" não carregam informação de
+        exploração e não servem para estimar contrafactuais de outras ações; só
+        "explore" oferece isso.
         """
         n = len(adjusted)
         k = min(k, n)
         remaining = list(range(n))
         chosen, slot_types, propensities = [], [], []
 
-        probs = _softmax(adjusted[remaining], SOFTMAX_TEMPERATURE)
-        pos = int(np.random.choice(remaining, p=probs))
+        # Slot 1: argmax determinístico -- nunca sorteado, nem em rodada de exploração.
+        best_in_remaining = int(np.argmax(adjusted[remaining]))
+        pos = remaining[best_in_remaining]
         chosen.append(pos)
-        slot_types.append("softmax")
-        propensities.append(float(probs[remaining.index(pos)]))
+        slot_types.append("greedy")
+        propensities.append(1.0)
         remaining.remove(pos)
 
         has_explore = False
@@ -1105,12 +1124,15 @@ class Recommender:
             propensities.append(1.0)
             remaining.remove(best_pos)
 
+        # Embaralha só a CAUDA (posições 1..k-1) para esconder do usuário qual delas é
+        # o slot exploratório -- o slot 1 (melhor item, greedy) NUNCA é movido: fica
+        # sempre fixo na posição 0, por contrato desta função.
         if has_explore and len(chosen) > 1:
-            order = list(range(len(chosen)))
-            random.shuffle(order)
-            chosen = [chosen[i] for i in order]
-            slot_types = [slot_types[i] for i in order]
-            propensities = [propensities[i] for i in order]
+            tail_order = list(range(1, len(chosen)))
+            random.shuffle(tail_order)
+            chosen = [chosen[0]] + [chosen[i] for i in tail_order]
+            slot_types = [slot_types[0]] + [slot_types[i] for i in tail_order]
+            propensities = [propensities[0]] + [propensities[i] for i in tail_order]
 
         return chosen, slot_types, propensities
 
@@ -1256,7 +1278,14 @@ def sanity_checks(recommender: Recommender, df: pd.DataFrame) -> None:
           f"(threshold arousal={SAFETY_AROUSAL_THRESHOLD:.3f}, "
           f"threshold valência aversiva={SAFETY_AVERSIVE_VALENCE_THRESHOLD:.3f})")
 
-    # 5. Duas chamadas idênticas produzem listas diferentes em fração razoável dos casos.
+    # 5. Duas chamadas idênticas produzem listas diferentes em fração razoável dos
+    # casos -- não mais por sorteio no slot 1 (agora determinístico: sempre o argmax
+    # de `adjusted`, ver _select_slots). A variação observada aqui vem de dois efeitos
+    # que continuam legítimos: (i) o próprio ato de recomendar registra fadiga
+    # (FatigueTracker.register), então a 2ª chamada de cada par já enxerga um pool
+    # diferente da 1ª; (ii) o slot exploratório (P_EXPLORE_SLOT) e o MMR continuam
+    # sorteados/variáveis nos slots 2/3. Sem valor fixo esperado -- é diagnóstico, não
+    # testa determinismo do slot 1 (ver teste dedicado em test_data_pipeline.py).
     trials = 20
     differing = sum(
         1
