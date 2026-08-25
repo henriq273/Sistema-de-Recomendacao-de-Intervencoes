@@ -757,12 +757,16 @@ def _build_tiny_recommender(n_items: int = 4, valencia: list = None, arousal: li
 
 def test_fatigue_blocked_mask_correctness():
     """FatigueTracker.blocked_mask bloqueia exatamente os itens com
-    delta < FATIGUE_MIN_GAP desde a última aparição, e libera os demais."""
+    delta < FATIGUE_MIN_GAP desde a última EXECUÇÃO, e libera os demais.
+    mark_executed()/advance_round() substituem o antigo register() único -- só o
+    item explicitamente marcado como executado entra em last_seen."""
     tracker = sysrec.FatigueTracker()
-    tracker.register(np.array([10]))   # item 10 visto no counter=0; counter vira 1
-    tracker.register(np.array([20]))   # item 20 visto no counter=1; counter vira 2
+    tracker.mark_executed(10)   # item 10 executado no counter=0
+    tracker.advance_round()     # counter vira 1
+    tracker.mark_executed(20)   # item 20 executado no counter=1
+    tracker.advance_round()     # counter vira 2
 
-    # counter agora é 2: delta(10)=2-0=2, delta(20)=2-1=1, delta(30)=nunca visto.
+    # counter agora é 2: delta(10)=2-0=2, delta(20)=2-1=1, delta(30)=nunca executado.
     mask = tracker.blocked_mask(np.array([10, 20, 30]))
     expected = np.array([2 < sysrec.FATIGUE_MIN_GAP, 1 < sysrec.FATIGUE_MIN_GAP, False])
     _check(
@@ -772,19 +776,49 @@ def test_fatigue_blocked_mask_correctness():
     )
 
 
+def test_fatigue_only_tracks_executed_items():
+    """Requisito central desta mudança: itens apenas EXIBIDOS (não escolhidos, ou
+    exibidos numa rodada onde o usuário não executou nada) não entram em cooldown
+    -- só mark_executed() registra um item. recommend() sozinho (sem
+    mark_executed() depois) nunca bloqueia nada."""
+    recommender, df = _build_tiny_recommender(n_items=4)
+
+    results = recommender.recommend(curr_oct=1, dest_oct=1, time_avail=60, k=2)
+    shown_ids = {r["item_idx"] for r in results}
+    _check(
+        "recommend() sozinho não marca nenhum item como executado (last_seen vazio)",
+        len(recommender.fatigue.last_seen) == 0,
+        f"last_seen={recommender.fatigue.last_seen} shown_ids={shown_ids}",
+    )
+
+    # Simula execução de apenas UM dos itens mostrados.
+    executed_id = results[0]["item_idx"]
+    recommender.fatigue.mark_executed(executed_id)
+    mask = recommender.fatigue.blocked_mask(df.index.to_numpy())
+    blocked_ids = set(df.index.to_numpy()[mask])
+    _check(
+        "só o item executado entra em cooldown -- os demais itens mostrados "
+        "(não escolhidos) continuam livres",
+        blocked_ids == {executed_id},
+        f"blocked_ids={blocked_ids} executed_id={executed_id} shown_ids={shown_ids}",
+    )
+
+
 def test_fatigue_never_empties_pool():
-    """Garantia da Parte 2: se TODOS os itens do pool foram mostrados há menos de
+    """Garantia da Parte 2: se TODOS os itens do pool foram executados há menos de
     FATIGUE_MIN_GAP interações, o bloqueio rígido não pode esvaziar o pool -- o
     Recommender reverte para o pool anterior (mesma regra do guardrail/curadoria)."""
     recommender, df = _build_tiny_recommender(n_items=4)
 
-    # Força TODOS os itens do catálogo como "recém-mostrados" (delta=1 < FATIGUE_MIN_GAP).
-    recommender.fatigue.register(df.index.to_numpy())
+    # Força TODOS os itens do catálogo como "recém-executados" (delta=1 < FATIGUE_MIN_GAP).
+    for item_idx in df.index.to_numpy():
+        recommender.fatigue.mark_executed(item_idx)
+    recommender.fatigue.advance_round()
 
     results = recommender.recommend(curr_oct=1, dest_oct=1, time_avail=60, k=2)
     _check(
         "fadiga nunca esvazia o pool: recommend() ainda devolve itens mesmo com "
-        "todo o catálogo 'recém-mostrado'",
+        "todo o catálogo 'recém-executado'",
         len(results) > 0,
         f"results={results}",
     )
@@ -854,22 +888,27 @@ def test_slot1_deterministic_and_respects_fatigue_spacing():
     requisito juntas:
       (a) slot 1 nunca tem score menor que os demais slots retornados na mesma
           chamada (condição necessária de ser o item de maior score do pool);
-      (b) o espaçamento (FATIGUE_MIN_GAP) continua valendo: nenhum item reaparece
-          no slot 1 com intervalo menor que FATIGUE_MIN_GAP chamadas consecutivas
-          no MESMO contexto.
+      (b) o espaçamento (FATIGUE_MIN_GAP) continua valendo PARA ITENS EXECUTADOS:
+          simulando que o usuário sempre executa a recomendação do slot 1 (via
+          fatigue.mark_executed, o mesmo caminho que _run_interaction usa), nenhum
+          item reaparece no slot 1 com intervalo menor que FATIGUE_MIN_GAP chamadas
+          consecutivas no MESMO contexto. recommend() sozinho não marca mais nada
+          como executado -- é por isso que o teste simula a execução explicitamente
+          a cada rodada, em vez de depender do registro automático que existia
+          antes desta mudança.
 
-    Catálogo dimensionado com folga -- (FATIGUE_MIN_GAP + 1) * TOP_K itens -- para
-    que o fallback de "nunca esvaziar o pool" do FatigueTracker nunca precise
-    disparar: com poucos itens, esse fallback (que reverte a filtragem quando ela
-    zeraria o pool) pode reintroduzir um item ainda em cooldown, invalidando a
-    garantia de espaçamento por escassez de catálogo, não por regressão real. No
-    pior caso, até 2*TOP_K itens ficam em cooldown simultaneamente (os mostrados
-    nas duas chamadas anteriores); (FATIGUE_MIN_GAP+1)*TOP_K garante sempre pelo
-    menos TOP_K itens livres. (Valencia, Arousal) em progressão linear até
-    (0.8, 0.8) = centroide do octante 1 (ISO_ALPHA=1.0) -- distâncias únicas, sem
-    empate, então o ranking geométrico é conhecido: item0 (distância 0) é o argmax
-    inequívoco na 1ª chamada."""
-    n_items = (sysrec.FATIGUE_MIN_GAP + 1) * sysrec.TOP_K
+    Catálogo dimensionado com folga -- FATIGUE_MIN_GAP + TOP_K itens -- para que o
+    fallback de "nunca esvaziar o pool" do FatigueTracker nunca precise disparar:
+    com poucos itens, esse fallback (que reverte a filtragem quando ela zeraria o
+    pool) pode reintroduzir um item ainda em cooldown, invalidando a garantia de
+    espaçamento por escassez de catálogo, não por regressão real. Como só o item
+    executado (1 por rodada, não mais os TOP_K exibidos) entra em cooldown, no pior
+    caso até FATIGUE_MIN_GAP-1 itens distintos ficam em cooldown simultaneamente;
+    FATIGUE_MIN_GAP+TOP_K garante sempre pelo menos TOP_K itens livres. (Valencia,
+    Arousal) em progressão linear até (0.8, 0.8) = centroide do octante 1
+    (ISO_ALPHA=1.0) -- distâncias únicas, sem empate, então o ranking geométrico é
+    conhecido: item0 (distância 0) é o argmax inequívoco na 1ª chamada."""
+    n_items = sysrec.FATIGUE_MIN_GAP + sysrec.TOP_K
     valencia = [0.8 - 0.05 * i for i in range(n_items)]
     arousal = [0.8 - 0.05 * i for i in range(n_items)]
     recommender, df = _build_tiny_recommender(n_items=n_items, valencia=valencia, arousal=arousal)
@@ -885,6 +924,9 @@ def test_slot1_deterministic_and_respects_fatigue_spacing():
         slot1_history.append(results[0]["item_idx"])
         if len(results) > 1 and results[0]["score"] < max(r["score"] for r in results[1:]):
             necessary_condition_ok = False
+        # Simula o usuário sempre executando a recomendação do slot 1 -- mesmo
+        # caminho que _run_interaction usa de verdade.
+        recommender.fatigue.mark_executed(results[0]["item_idx"])
 
     _check(
         "primeira chamada: slot 1 é o item geometricamente mais próximo do alvo "
@@ -925,6 +967,7 @@ def main() -> None:
     test_safety_filter_r2_blocks_high_energy_octant()
     test_safety_filter_never_empties_eligible()
     test_fatigue_blocked_mask_correctness()
+    test_fatigue_only_tracks_executed_items()
     test_fatigue_never_empties_pool()
     test_time_filter_toggle()
     test_select_slots_slot1_always_greedy_argmax()

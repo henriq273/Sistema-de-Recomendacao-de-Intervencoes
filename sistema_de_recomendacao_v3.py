@@ -297,17 +297,25 @@ P_EXPLORE_SLOT = 0.5        # probabilidade de um dos slots ser exploratório
 MMR_LAMBDA = 0.7            # 0.7*relevância - 0.3*similaridade (diversidade da lista)
 FATIGUE_LAMBDA = 0.5        # peso máximo da penalidade de fadiga
 FATIGUE_HALFLIFE = 10       # em nº de interações; meia-vida do decaimento da penalidade
-# Nº mínimo de interações antes de um item poder reaparecer (bloqueio RÍGIDO,
-# aplicado no pool antes da pontuação -- ver FatigueTracker.blocked_mask). A
-# penalidade suave acima (FATIGUE_LAMBDA/FATIGUE_HALFLIFE) nunca garante espaçamento
-# por construção: fatigue_diagnostics.py mediu, contra o catálogo real, que em 0%
-# dos contextos a penalidade máxima sequer supera o gap de score real entre 1º e 2º
-# colocado -- ou seja, ela nunca tem força para trocar o item escolhido, e o mesmo
-# item reaparecia na interação imediatamente seguinte em 32.5% dos casos (contexto
-# fixo, pior caso). Ex.: item mostrado na interação t -> bloqueado em t+1 e t+2
-# (delta=1,2) -> elegível de novo a partir de t+3 (delta=3), ainda com a penalidade
-# suave decrescente por cima.
-FATIGUE_MIN_GAP = 3
+# Nº mínimo de RODADAS EXECUTADAS antes de um item poder reaparecer (bloqueio
+# RÍGIDO, aplicado no pool antes da pontuação -- ver FatigueTracker.blocked_mask).
+# A penalidade suave acima (FATIGUE_LAMBDA/FATIGUE_HALFLIFE) nunca garante
+# espaçamento por construção (fatigue_diagnostics.py mediu, contra o catálogo real,
+# que em 0% dos contextos a penalidade máxima sequer supera o gap de score real
+# entre 1º e 2º colocado -- ou seja, ela nunca tem força para trocar o item
+# escolhido sozinha).
+#
+# IMPORTANTE: o cooldown só é aplicado ao item que o usuário de fato EXECUTOU
+# (FatigueTracker.mark_executed, chamado em _run_interaction quando a escolha não
+# é "[0] Não executei"), não a todos os itens apenas exibidos na lista. Itens
+# mostrados em slots que o usuário não escolheu, ou rodadas onde nada foi
+# executado, não entram em cooldown. O contador de rodadas (FatigueTracker.counter)
+# continua avançando a cada chamada de recommend() (FatigueTracker.advance_round),
+# independente de execução -- só o registro de "quem está em cooldown" é que fica
+# condicionado à execução. Ex.: item executado na rodada t -> bloqueado em
+# t+1..t+(FATIGUE_MIN_GAP-1) -> elegível de novo a partir de t+FATIGUE_MIN_GAP,
+# ainda com a penalidade suave decrescente por cima.
+FATIGUE_MIN_GAP = 10
 TOP_K = 3                   # itens recomendados por vez
 
 # Persistência - conservar pesos, histórico de treino e log de interações
@@ -821,20 +829,29 @@ exibir. Nada aqui altera pesos, gradientes ou o que o modelo aprende.
 O treino (Agent.replay()) continua enxergando os Q-values puros."""
 
 class FatigueTracker:
-    """Espaçamento de recomendações: bloqueio RÍGIDO dos FATIGUE_MIN_GAP primeiros
-    deltas (blocked_mask, aplicado no pool antes da pontuação) + penalidade suave
+    """Espaçamento de recomendações: bloqueio RÍGIDO dos FATIGUE_MIN_GAP primeiras
+    rodadas (blocked_mask, aplicado no pool antes da pontuação) + penalidade suave
     decrescente por cima, para itens que já passaram do bloqueio (penalty, aplicada
     depois da pontuação). O bloqueio garante o intervalo mínimo por construção; a
-    penalidade sozinha não garante (ver FATIGUE_MIN_GAP e fatigue_diagnostics.py)."""
+    penalidade sozinha não garante (ver FATIGUE_MIN_GAP e fatigue_diagnostics.py).
+
+    Cooldown só para itens EXECUTADOS: mark_executed() é chamado só para o item que
+    o usuário de fato escolheu e executou (_run_interaction, quando a escolha não é
+    "[0] Não executei") -- itens apenas exibidos em outros slots, ou rodadas sem
+    execução nenhuma, nunca entram em cooldown. advance_round() avança o contador de
+    rodadas (usado para calcular delta) uma vez por chamada de recommend(),
+    independente de o usuário ter executado algo -- as duas coisas são
+    deliberadamente separadas (register() antigo fazia as duas juntas para TODOS os
+    itens exibidos; ver histórico)."""
 
     def __init__(self):
         self.last_seen: dict[int, int] = {}
         self.counter = 0
 
     def blocked_mask(self, item_indices: np.ndarray) -> np.ndarray:
-        """Bloqueio RÍGIDO: item mostrado há menos de FATIGUE_MIN_GAP interações
-        não entra no pool de seleção. Diferente de penalty() -- que só desestimula
-        sem garantir espaçamento -- isto garante o intervalo mínimo."""
+        """Bloqueio RÍGIDO: item executado há menos de FATIGUE_MIN_GAP rodadas não
+        entra no pool de seleção. Diferente de penalty() -- que só desestimula sem
+        garantir espaçamento -- isto garante o intervalo mínimo."""
         blocked = np.zeros(len(item_indices), dtype=bool)
         for i, item_idx in enumerate(item_indices):
             if item_idx in self.last_seen:
@@ -853,9 +870,16 @@ class FatigueTracker:
                 penalties[i] = FATIGUE_LAMBDA * 0.5 ** (delta / FATIGUE_HALFLIFE)
         return penalties
 
-    def register(self, item_indices: np.ndarray) -> None:
-        for item_idx in item_indices:
-            self.last_seen[int(item_idx)] = self.counter
+    def mark_executed(self, item_idx: int) -> None:
+        """Registra que ESTE item (e só ele) foi de fato executado na rodada atual
+        -- só ele entra em cooldown. Não chama advance_round() sozinho: várias
+        chamadas dentro da mesma rodada (se algum dia existirem) devem compartilhar
+        o mesmo `counter`."""
+        self.last_seen[int(item_idx)] = self.counter
+
+    def advance_round(self) -> None:
+        """Avança o contador de rodadas -- chamado uma vez por recommend(),
+        independente de o usuário ter executado alguma intervenção depois."""
         self.counter += 1
 
     def state_dict(self) -> dict:
@@ -903,6 +927,16 @@ class Recommender:
         return len(self.recommended_items) / len(self.df)
 
     def recommend(self, curr_oct: int, dest_oct: int, time_avail: float, k: int = TOP_K) -> list[dict]:
+        # Avança a rodada de fadiga logo no início -- não no fim. O item
+        # eventualmente executado só é marcado (fatigue.mark_executed) DEPOIS que
+        # esta função já retornou (em _run_interaction, quando o usuário escolhe
+        # algo). Se o contador só avançasse no fim, mark_executed() carimbaria
+        # last_seen com o contador da PRÓXIMA rodada (já incrementado), atrasando o
+        # desbloqueio em 1 rodada a mais do que FATIGUE_MIN_GAP pede. Avançando
+        # aqui, o contador usado na pontuação desta rodada é o mesmo que
+        # mark_executed() vai usar logo depois, até a próxima chamada.
+        self.fatigue.advance_round()
+
         if TIME_FILTER_ENABLED:
             eligible = self.df.index[self.df["Duracao"] <= time_avail].to_numpy(dtype=int)
         else:
@@ -963,7 +997,6 @@ class Recommender:
             })
             self.recommended_items.add(item_idx)
 
-        self.fatigue.register(np.array([r["item_idx"] for r in results], dtype=int))
         return results
 
     def _apply_safety_filter(self, eligible: np.ndarray, curr_oct: int, dest_oct: int) -> np.ndarray:
@@ -1583,6 +1616,11 @@ def _run_interaction(recommender: Recommender, agent: Agent, feature_space: Feat
         return True
 
     item = recommendations[labels.index(choice)]
+    # Espaçamento (FATIGUE_MIN_GAP) só se aplica a itens de fato executados -- ver
+    # FatigueTracker.mark_executed. Marcado aqui, independente do nível de feedback
+    # dado a seguir (mesmo "muito ruim" significa que o usuário executou a
+    # intervenção, então ela entra em cooldown do mesmo jeito).
+    recommender.fatigue.mark_executed(item["item_idx"])
     try:
         feedback_level, reward = _read_feedback()
     except KeyboardInterrupt:

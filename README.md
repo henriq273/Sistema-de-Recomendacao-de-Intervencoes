@@ -235,9 +235,12 @@ Foi rodando este script que se confirmou (contra o catálogo real) que a penalid
 suave sozinha nunca garantia espaçamento: em 0% dos contextos ela superava o gap de
 score real, e o mesmo item reaparecia na interação imediatamente seguinte em ~33%
 dos casos no pior cenário. Por isso `FatigueTracker` tem um bloqueio **rígido**
-(`FATIGUE_MIN_GAP`, nº mínimo de interações antes de um item poder reaparecer,
-aplicado no pool antes da pontuação) além da penalidade suave (que continua atuando
-sobre os itens já liberados do bloqueio). Rodar este script de novo depois de mudar
+(`FATIGUE_MIN_GAP`, nº mínimo de rodadas executadas antes de um item poder
+reaparecer, aplicado no pool antes da pontuação) além da penalidade suave (que
+continua atuando sobre os itens já liberados do bloqueio). O script simula que o
+usuário sempre executa a recomendação do slot 1 (`FatigueTracker.mark_executed`,
+mesmo caminho que `_run_interaction` usa de verdade) para medir o cooldown real.
+Rodar este script de novo depois de mudar
 `FATIGUE_MIN_GAP`/`CANDIDATE_POOL_SIZE` confirma que nenhum gap abaixo do mínimo
 configurado aparece mais, e que o pool não ficou degenerado em nenhum contexto.
 
@@ -286,13 +289,17 @@ nesta versão. O filtro e a pergunta continuam no código, só desativados por e
 flag — reativar trocando `TIME_FILTER_ENABLED` para `True` em
 `sistema_de_recomendacao_v3.py`, sem precisar restaurar nada manualmente.
 
-**Espaçamento de recomendações (`FATIGUE_MIN_GAP = 3`).** Além da penalidade suave
+**Espaçamento de recomendações (`FATIGUE_MIN_GAP = 10`).** Além da penalidade suave
 de fadiga (que só desestimula, nunca garante espaçamento — ver
-`fatigue_diagnostics.py` acima), um item mostrado não pode reaparecer nas
-`FATIGUE_MIN_GAP` interações seguintes (bloqueio rígido, aplicado no pool antes da
-pontuação). Ajustar `FATIGUE_MIN_GAP` em `sistema_de_recomendacao_v3.py`; valores
-muito altos frente a `CANDIDATE_POOL_SIZE` podem degenerar o pool em catálogos
-pequenos ou pouco diversos — reconfirmar com `fatigue_diagnostics.py` depois de mudar.
+`fatigue_diagnostics.py` acima), um item **executado** não pode reaparecer nas
+`FATIGUE_MIN_GAP` rodadas seguintes (bloqueio rígido, aplicado no pool antes da
+pontuação). O cooldown só vale para o item que o usuário de fato escolheu e
+executou (`FatigueTracker.mark_executed`, chamado em `_run_interaction` quando a
+escolha não é "[0] Não executei") — itens apenas exibidos em outros slots, ou
+rodadas em que nada foi executado, não entram em cooldown. Ajustar `FATIGUE_MIN_GAP`
+em `sistema_de_recomendacao_v3.py`; valores muito altos frente a
+`CANDIDATE_POOL_SIZE` podem degenerar o pool em catálogos pequenos ou pouco
+diversos — reconfirmar com `fatigue_diagnostics.py` depois de mudar.
 
 ## Limpeza de dados residuais
 

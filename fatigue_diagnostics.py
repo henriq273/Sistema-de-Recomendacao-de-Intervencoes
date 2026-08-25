@@ -9,6 +9,16 @@ DATA_BACKEND). Usado antes e depois da correção de espaçamento com garantia
 mínima (FATIGUE_MIN_GAP, ver FatigueTracker.blocked_mask) para confirmar, com
 números reais, o problema e a correção.
 
+IMPORTANTE: o cooldown de fadiga só se aplica a itens que o usuário de fato
+EXECUTA (FatigueTracker.mark_executed) -- recommend() sozinho não marca mais nada.
+Este script simula que o usuário sempre executa a recomendação do slot 1 (a
+"melhor", já que agora é sempre o argmax determinístico -- ver
+Recommender._select_slots), chamando mark_executed nela após cada rodada. Por
+isso "gaps_top1" reflete o comportamento real do espaçamento; "gaps_any_slot"
+inclui itens de slots 2/3 que nunca foram "executados" nesta simulação e por
+construção não têm cooldown nenhum -- útil para contraste, não para medir o
+mecanismo de espaçamento em si.
+
 Uso:
     python fatigue_diagnostics.py
 """
@@ -22,10 +32,12 @@ import sistema_de_recomendacao_v3 as sysrec
 
 def trace_repeats(recommender: sysrec.Recommender, contexts: list, k: int = None) -> dict:
     """
-    Roda recommend() para uma sequência de contextos (fixa ou variada), registra
-    em que índice de interação cada item apareceu -- em qualquer slot da lista, e
-    separadamente só no slot 1 (o mais consequente) -- e calcula os intervalos
-    (gaps) entre aparições consecutivas do mesmo item.
+    Roda recommend() para uma sequência de contextos (fixa ou variada), simulando
+    que o usuário sempre executa a recomendação do slot 1 (mark_executed -- mesmo
+    caminho que _run_interaction usa de verdade). Registra em que índice de
+    interação cada item apareceu -- em qualquer slot da lista, e separadamente só
+    no slot 1 (o mais consequente, e o único "executado" nesta simulação) -- e
+    calcula os intervalos (gaps) entre aparições consecutivas do mesmo item.
     """
     k = sysrec.TOP_K if k is None else k
     appearances = defaultdict(list)
@@ -37,6 +49,7 @@ def trace_repeats(recommender: sysrec.Recommender, contexts: list, k: int = None
             appearances[r["item_idx"]].append(i)
         if results:
             appearances_top1[results[0]["item_idx"]].append(i)
+            recommender.fatigue.mark_executed(results[0]["item_idx"])
 
     def _gaps(appearance_dict):
         out = []
