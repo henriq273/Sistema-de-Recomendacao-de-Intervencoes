@@ -47,9 +47,11 @@ A fonte de dados é escolhida pela constante `DATA_BACKEND` no topo de
 `sistema_de_recomendacao_v3.py`:
 
 - **`"csv"`** — lê `dataset.csv` via `load_dataset()`. Não depende de rede nem de
-  `pymongo`. É o backend usado **sempre** pela bancada de teste offline (`--eval`),
-  independentemente do valor de `DATA_BACKEND` — a bancada pressupõe esse dataset
-  sintético específico.
+  `pymongo`. Dataset sintético de prototipagem. A bancada de teste offline
+  (`--eval`, ver seção "Bancada de teste offline do modelo" abaixo) segue
+  `DATA_BACKEND` como qualquer outro ponto de carga do catálogo — para rodá-la
+  sobre este dataset sintético (comportamento fixo e conhecido), defina
+  `DATA_BACKEND = "csv"` antes de chamar `--eval`.
 
 - **`"json_export"` (padrão)** — lê um catálogo real a partir de arquivos locais gerados por
   `mongoexport --jsonArray`, um por modalidade, **sem depender de conexão viva nem de
@@ -257,11 +259,24 @@ python test_data_pipeline.py
 
 Sanity checks estruturais, cobertura/diversidade, uso da escala de feedback,
 baselines (aleatório / mais popular / conteúdo puro / agente online) e calibração da
-cabeça categórica — sempre sobre `dataset.csv`, nunca usada para treinar o modelo real:
+cabeça categórica — nunca usada para treinar o modelo real. Segue `DATA_BACKEND`
+como qualquer outro ponto de carga do catálogo (não é mais um caso especial): com o
+padrão atual (`"json_export"`), roda contra o catálogo real (~210 itens do GAPED).
+Para reproduzir a bancada fixa sobre o CSV sintético, defina `DATA_BACKEND = "csv"`
+antes de rodar.
 
 ```bash
 python sistema_de_recomendacao_v3.py --eval
 ```
+
+O treino de baselines (3000 episódios) domina o tempo total pelo número de
+iterações, não pelo tamanho do catálogo — já levava minutos contra o CSV sintético
+e continua na mesma ordem de grandeza contra o catálogo real; rode com um timeout
+generoso ou em background.
+
+O simulador de feedback usado aqui (`simulate_feedback_holdout`) usa bônus por
+`category` contra o catálogo real (ex.: GAPED "positive"/"neutral") em vez de
+Tipo/Indoor, que degeneravam lá — ver a docstring da função.
 
 ## 4. Rodar o programa
 

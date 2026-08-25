@@ -1244,9 +1244,37 @@ def simulate_feedback_holdout(curr_oct: int, dest_oct: int, item: pd.Series) -> 
     Perfil alternativo de feedback, com bônus contextuais diferentes de simulate_feedback.
     Uso exclusivo em avaliação (baselines): treinar e avaliar contra perfis distintos é o
     que evita medir imitação em vez de generalização.
+
+    Bônus com dois perfis, escolhidos automaticamente pela presença da coluna
+    `category` (só existe em itens do catálogo real -- data_source.
+    _to_feature_space_schema -- nunca no CSV sintético):
+      - Catálogo real: bônus por `category` (ex.: GAPED "positive"/"neutral") --
+        é o atributo que de fato varia por item hoje e deve continuar variando
+        conforme mais datasets (OASIS/EmoMadrid) forem aprovados. As regras
+        antigas por Tipo/Indoor degeneravam contra o catálogo real: Tipo nunca é
+        "Mindfulness" (só existe no CSV sintético) e Indoor nunca é 1
+        (data_source.py zera Indoor para todo item real, incondicional) -- a
+        única regra que sobrava (Tipo=="Imagem" em HIGH_ENERGY_OCTANTS) ficava
+        incondicionalmente verdadeira para o catálogo atual (100% Imagem), sem
+        discriminar entre itens.
+      - CSV sintético (sem `category`): mantém as regras originais por
+        Tipo/Indoor, sem mudança -- preserva a bancada fixa e conhecida de quem
+        rodar com DATA_BACKEND="csv".
     """
     def bonus(octant: int, item_: pd.Series) -> float:
         b = 0.0
+        category = item_.get("category")
+        if category is not None:
+            # Catálogo real: "positive" anima um estado de baixa energia;
+            # "neutral" acalma um estado de hiperativação, sem estimular mais.
+            if octant in LOW_ENERGY_OCTANTS and category == "positive":
+                b += 0.1
+            if octant in HIGH_ENERGY_OCTANTS and category == "neutral":
+                b += 0.1
+            if octant == 2 and category == "neutral":
+                b += 0.05
+            return b
+        # CSV sintético: regras originais, inalteradas.
         if octant in LOW_ENERGY_OCTANTS and item_["Tipo"] == "Mindfulness":
             b += 0.1
         if octant in HIGH_ENERGY_OCTANTS and item_["Tipo"] == "Imagem":
@@ -1362,6 +1390,10 @@ def baselines(df: pd.DataFrame, feature_space: FeatureSpace, n_episodes: int = 1
     Um sistema neural que não supera "conteúdo puro" não está agregando valor — este é
     o baseline crítico. Retorna o Agent treinado (agent_online) para reaproveitamento em
     calibration_check, evitando treinar um segundo agente do zero só para isso.
+
+    Bônus do simulador holdout (simulate_feedback_holdout) usa `category` contra
+    o catálogo real (Tipo/Indoor degeneravam lá) e mantém as regras originais por
+    Tipo/Indoor contra o CSV sintético -- ver docstring da função.
     """
     agent = Agent(df, feature_space)
 
@@ -1688,11 +1720,31 @@ def main(dataset_path: str = None, carregar: str = None, salvar: str = CHECKPOIN
 def _run_offline_evaluation() -> None:
     # Bancada de teste completa: sanity checks, cobertura/diversidade, baselines,
     # uso da escala de feedback e calibração da cabeça categórica.
-    # Sempre sobre o CSV sintético, independente de DATA_BACKEND: é uma bancada fixa e
-    # conhecida (contagens como "22/100 bloqueados" no sanity check pressupõem esse
-    # dataset específico), não o caminho de produção -- ver load_active_catalog() para o backend real.
+    # Segue DATA_BACKEND como qualquer outro ponto de carga do catálogo (main(),
+    # characterize.py, fatigue_diagnostics.py, review_negative_tail.py) -- não é
+    # mais um caso especial que ignora a config. Com DATA_BACKEND="json_export"
+    # (padrão atual), roda contra o catálogo real (~210 itens do GAPED, todos
+    # Tipo="Imagem"/Indoor=0 -- ver data_source.py). Para reproduzir a bancada
+    # fixa sobre o CSV sintético (comportamento antigo desta função), defina
+    # DATA_BACKEND = "csv" antes de rodar -- load_dataset()/o backend "csv" em
+    # load_active_catalog() continuam intactos.
+    #
+    # Ressalva herdada, não corrigida aqui: o guardrail (check [4] de
+    # sanity_checks) usa SAFETY_AROUSAL_THRESHOLD/SAFETY_AVERSIVE_VALENCE_THRESHOLD,
+    # ainda não recalibrados para este catálogo curado -- ver comentário "AINDA NÃO
+    # CALIBRADOS..." acima da definição das duas constantes. O check imprime
+    # contagem e limiares ao vivo, sem valor fixo esperado; não quebra, só não
+    # valida calibração.
     set_seed(SEED)
-    df = load_dataset()
+    df = load_active_catalog()
+    if len(df) == 0:
+        raise RuntimeError(
+            "Catálogo vazio -- confirme se APPROVED_CATEGORIES já foi populada (ver "
+            "safety.explore_taxonomy); caso contrário, confirme se os exports em dbs/ "
+            "(ou a conexão Mongo) têm itens com Valência/Arousal resolvíveis. A "
+            "bancada offline (--eval) não tem como rodar sanity checks/baselines "
+            "sobre um catálogo vazio."
+        )
     feature_space = FeatureSpace(df)
     agent = Agent(df, feature_space)
     recommender = Recommender(df, feature_space, agent)
