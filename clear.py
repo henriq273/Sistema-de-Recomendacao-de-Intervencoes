@@ -20,9 +20,6 @@ import shutil
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Nomes vêm de CHECKPOINT_PATH/INTERACTION_LOG_PATH em sistema_de_recomendacao_v2.py e
-# v3.py. Usa glob para "checkpoint*.pt" para não ficar preso a um nome exato se um
-# futuro checkpoint (ex.: checkpoint_v4.pt) for adicionado.
 CHECKPOINT_GLOB = "checkpoint*.pt"
 INTERACTION_LOG_GLOB = "interaction_log*.jsonl"
 

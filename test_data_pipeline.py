@@ -299,10 +299,12 @@ def test_safety_filter_r2_blocks_high_energy_octant():
     quando curr_oct está em HIGH_ENERGY_OCTANTS -- a versão anterior só cobria
     LOW_ENERGY_OCTANTS (R1), deixando hiperativação (3/4) sem proteção equivalente.
     dest_oct=1 (Excitado/Eufórico, ta=0.8>=0 e tv=0.8>0) é escolhido para não
-    acionar R3 (precisa ta<0) nem R4 (precisa Valencia abaixo do limiar aversivo)."""
+    acionar R3 (precisa ta<0) nem R4 (precisa Valencia abaixo do limiar aversivo) --
+    Valencia fixada relativa a SAFETY_AVERSIVE_VALENCE_THRESHOLD (não um valor
+    absoluto) para continuar acima do limiar independente de recalibração."""
     df = _make_safety_filter_df(
         arousals=[sysrec.SAFETY_AROUSAL_THRESHOLD - 0.1, sysrec.SAFETY_AROUSAL_THRESHOLD + 0.1],
-        valencias=[0.1, 0.1],
+        valencias=[sysrec.SAFETY_AVERSIVE_VALENCE_THRESHOLD + 0.1] * 2,
     )
     fake_self = types.SimpleNamespace(df=df, safety_checked=0, safety_blocked=0)
     eligible = df.index.to_numpy()

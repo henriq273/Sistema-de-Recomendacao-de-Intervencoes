@@ -140,9 +140,31 @@ contagens, subcategorias = explore_taxonomy()
 contornando a curadoria de propósito — é a ferramenta que informa a decisão de
 aprovar uma categoria, não pode depender da aprovação já ter acontecido.
 
+Para datasets **sem** evidência de que as Camadas 2–4 (keyword/geométrica/item_id)
+deixem passar conteúdo problemático, `safety.auto_approve_clean_categories()`
+automatiza a aprovação em lote: aprova todo par `(dataset, category)`, restrito aos
+datasets passados, cuja categoria/subcategorias não batam com nenhum termo de
+`SAFETY_DENYLIST_KEYWORDS`. Não desativa nenhuma camada — Camadas 2/3/4 continuam
+atuando item a item dentro das categorias aprovadas.
+
+```python
+from safety import auto_approve_clean_categories
+
+auto_approve_clean_categories(dry_run=True)   # só imprime o que seria aprovado
+aprovados = auto_approve_clean_categories(dry_run=False)  # aplica e retorna o conjunto
+```
+
+Datasets sem taxonomia de categoria dedicada a conteúdo negativo (hoje **OASIS** e
+**EmoMadrid**, onde a revisão manual da cauda negativa já encontrou casos que a
+denylist/filtro geométrico deixaram passar) ficam deliberadamente fora de
+`AUTO_APPROVE_SAFE_DATASETS` — dependem de `review_negative_tail.py` (abaixo). GAPED
+também fica fora: resolve-se por regra estrutural própria (só as categorias
+neutra/positiva da taxonomia documentada), não por auto-aprovação.
+
 `APPROVED_CATEGORIES`/`BLOCKED_ITEM_IDS` são editados manualmente em
-`sistema_de_recomendacao_v3.py`, como qualquer alteração de código — revisado e
-versionado em git, nunca escrito de volta no banco.
+`sistema_de_recomendacao_v3.py`, como qualquer alteração de código (com comentário
+de proveniência por bloco) — revisado e versionado em git, nunca escrito de volta
+no banco.
 
 ### Revisão manual da cauda negativa (`review_negative_tail.py`)
 
@@ -197,11 +219,18 @@ inconsistente com as próprias tags/oitante/quadrante do item.
 
 Script standalone, fora do caminho de produção — roda contra o catálogo carregado
 via `load_active_catalog()` (qualquer `DATA_BACKEND`) e produz um relatório
-estatístico do dataset real (distribuição de Valência/Arousal geral e por
+estatístico do dataset real: composição do catálogo por dataset/modalidade/
+(dataset, category) com aviso automático se um dataset concentrar mais de 50% do
+total (`report_catalog_composition`), distribuição de Valência/Arousal geral e por
 modalidade, densidade por oitante geométrico, duração por modalidade/bucket de
 tempo, sobrevivência da curadoria por dataset, confiabilidade da origem
 psychometric/heuristic, tamanho de pool na grade completa de contextos, reaudição
-de normalização e consistência interna agregada):
+de normalização, consistência interna agregada, vocabulário de `Tipo`/`category`
+referenciado pelos bônus dos simuladores de feedback contra o catálogo real
+(`report_simulator_vocabulary` — sinaliza bônus que nunca disparam) e
+degenerescência dos blocos de feature usados pelo MMR (`report_feature_degeneracy`
+— quanto cada bloco distingue itens; informa se baixa diversidade intra-lista vem
+de features degeneradas ou de um pool naturalmente homogêneo):
 
 ```bash
 python characterize.py
@@ -219,6 +248,10 @@ atender ao piso, sinaliza para revisão manual em vez de escolher um valor
 silenciosamente inseguro. Os valores calibrados vão manualmente em
 `SAFETY_AROUSAL_THRESHOLD`/`SAFETY_AVERSIVE_VALENCE_THRESHOLD`
 (`sistema_de_recomendacao_v3.py`), como qualquer alteração de código.
+`verify_guardrail_effective` reconfirma, depois de aplicar os novos limiares, que o
+guardrail de fato bloqueia itens (>0) em todo par `(curr, dest)` de
+`LOW_ENERGY_OCTANTS`/`HIGH_ENERGY_OCTANTS` × `ALLOWED_DEST_OCTANTS` — um guardrail
+que bloqueia 0 itens não está protegendo.
 
 ### Diagnóstico de espaçamento de recomendações (`fatigue_diagnostics.py`)
 
@@ -261,13 +294,51 @@ Sanity checks estruturais, cobertura/diversidade, uso da escala de feedback,
 baselines (aleatório / mais popular / conteúdo puro / agente online) e calibração da
 cabeça categórica — nunca usada para treinar o modelo real. Segue `DATA_BACKEND`
 como qualquer outro ponto de carga do catálogo (não é mais um caso especial): com o
-padrão atual (`"json_export"`), roda contra o catálogo real (~210 itens do GAPED).
-Para reproduzir a bancada fixa sobre o CSV sintético, defina `DATA_BACKEND = "csv"`
-antes de rodar.
+padrão atual (`"json_export"`), roda contra o catálogo real (GAPED +
+DEAM/EMOPIA/MEDITATION_LOCAL/MuVi auto-aprovados, ver `APPROVED_CATEGORIES`). Para
+reproduzir a bancada fixa sobre o CSV sintético, defina `DATA_BACKEND = "csv"` antes
+de rodar.
+
+O check [2] mede proximidade ao ponto-alvo no plano V-A (`check_proximity_to_target`,
+sobre toda a grade `curr × ALLOWED_DEST_OCTANTS`) em vez de valência bruta num único
+par — a comparação antiga não discriminava nada perto da média do catálogo. O check
+[3] (`check_state_sensitivity`) roda em modo `deterministic=True` (sem softmax
+exploratório nem embaralhamento de cauda) para isolar sensibilidade real ao oitante
+atual do ruído estocástico já medido pelo check [5]; usa `register_fatigue=False`
+para não inflar o contador de fadiga da instância de `Recommender` compartilhada
+pelos demais checks.
 
 ```bash
 python sistema_de_recomendacao_v3.py --eval
 ```
+
+### Regret cumulativo e heatmap 8×8 (parte da bancada `--eval`)
+
+Duas métricas adicionais, com garantias de isolamento opostas por design:
+
+- **Regret cumulativo** (`report_regret`/`regret_curve`) compara, episódio a
+  episódio independente (sem estado de cooldown entre eles — mesmo padrão de
+  `baselines()`), a recompensa do agente contra um **oráculo** determinístico
+  (`oracle_pick`/`expected_reward_proxy`): o item de maior valor esperado
+  aproximado segundo o MESMO bônus de `simulate_feedback_holdout`
+  (`_holdout_bonus`, fatorado como função de módulo para os dois lados
+  reaproveitarem). **Nunca instancia `Recommender` nem `FatigueTracker`** —
+  garantia deliberada, para que o regret meça só o que o agente aprendeu, sem o
+  guardrail/fadiga/MMR de produção no meio.
+- **Heatmap 8×8** (`report_octant_heatmap`/`octant_heatmap`) mede o oposto: o
+  comportamento real de produção (`Recommender.recommend()`, guardrail + fadiga +
+  MMR inclusos) por par (oitante atual, oitante desejado), com uma instância nova
+  de `Recommender` a cada célula — a fadiga não vaza entre células, mas
+  **dentro** da mesma célula o cooldown é mantido de propósito, para refletir
+  pedidos repetidos do mesmo par. Usa o agente já treinado por `baselines()`
+  (`trained_agent`), não um agente recém-inicializado.
+
+`_p_execution`/`_alignment_score` (fatorados de `_simulate`) expõem a parte
+determinística do simulador holdout para o oráculo, sem precisar rodar Monte
+Carlo a cada candidato — `expected_reward_proxy` é uma aproximação (ignora o
+ruído gaussiano, que tem média zero, e quantiza o valor médio em vez de calcular
+o valor esperado da quantização exatamente), então o regret medido é fiel ao
+simulador holdout, não uma verdade de usuário real.
 
 O treino de baselines (3000 episódios) domina o tempo total pelo número de
 iterações, não pelo tamanho do catálogo — já levava minutos contra o CSV sintético

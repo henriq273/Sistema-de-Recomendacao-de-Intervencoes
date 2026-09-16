@@ -53,7 +53,11 @@ HIDDEN_DIMS = (128, 64, 32)
 DROPOUT = 0.2
 LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 1e-5
-BATCH_SIZE = 64
+# Piloto esperado: ~15 usuários x ~5 interações = ~75 feedbacks reais. Com
+# BATCH_SIZE=64, replay() só treina a partir do feedback #64 -- 84% do piloto
+# rodaria sem nenhum passo de gradiente (36 passos totais ao fim). Recalibrado
+# para BATCH_SIZE=8: treino começa no feedback #8, ~204 passos no mesmo volume.
+BATCH_SIZE = 8
 GRAD_CLIP_NORM = 1.0
 TARGET_TAU = 0.005
 
@@ -63,9 +67,14 @@ UPDATES_PER_FEEDBACK = 3    # passos de replay por feedback recebido
 GAMMA = 0.99                   # fator de desconto do futuro (0 = só recompensa imediata)
 
 # Prioritized Experience Replay
-MEMORY_CAPACITY = 5000
+MEMORY_CAPACITY = 5000       # buffer não chega perto de encher com ~75 transições do piloto
 PER_ALPHA = 0.6              # 0 = uniforme, 1 = priorização total
 PER_BETA = 0.4                # correção de viés de importance sampling (cresce até 1)
+# Calibrado supondo muitos passos de replay. Com ~204 passos (piloto, BATCH_SIZE=8),
+# beta sobe de 0.4 para so ~0.42 -- longe do teto 1.0: a correção de viés de importance
+# sampling do PER fica praticamente inativa durante todo o piloto. Não é bug; em regime
+# de N pequeno o PER opera essencialmente como replay priorizado sem correção completa
+# de viés. Não ajustado agora -- mexer sem medir seria chute.
 PER_BETA_INCREMENT = 1e-4
 PER_EPSILON = 1e-5           # evita prioridade zero
 
@@ -78,44 +87,49 @@ ISO_ALPHA = 1.0
 # Conjunto de candidatos
 CANDIDATE_POOL_SIZE = 12    # M itens mais próximos do ponto-alvo entram no pool
 
-# --- Filtro por tempo disponível: EM STAND-BY ---
-# Motivo: [preencher com a razão do projeto]. O filtro e a pergunta continuam no
-# código, desativados por esta flag -- reativar trocando para True, sem precisar
-# restaurar nada manualmente.
+# Filtro por tempo disponível: por enquanto em stand-by, ainda irrelevante
+# para o catálogo atual e para os primeiros testes online
+
 TIME_FILTER_ENABLED = False
 
 # Guardrail de segurança
 USE_SAFETY_FILTER = True
 LOW_ENERGY_OCTANTS = (5, 6)      # Triste/Deprimido, Entediado/Cansado
 HIGH_ENERGY_OCTANTS = (3, 4)     # Estressado/Ansioso, Irritado/Raiva
-# AINDA NÃO CALIBRADOS contra o catálogo restrito desta branch (curadoria com
-# allowlist estrita ativa) -- ver Parte E do plano de consolidação. Valores
-# provisórios: SAFETY_AROUSAL_THRESHOLD mantém o original (calibrado sobre o
-# dataset sintético); SAFETY_AVERSIVE_VALENCE_THRESHOLD reusa SAFETY_MIN_VALENCE_REVIEW
-# como placeholder conservador. NÃO copiar -0.053/-0.390 daqui: esses números foram
-# calibrados sobre o catálogo SEM a Camada 1 de curadoria (branch exploratória,
-# allowlist desativada) -- inválidos para a distribuição restrita desta branch.
-# Recalibrar com characterize.py (calibrate_guardrail_thresholds/
-# calibrate_valence_threshold) assim que APPROVED_CATEGORIES estiver populada de
-# verdade (Parte D do plano).
-SAFETY_AROUSAL_THRESHOLD = 0.6              # itens acima disso são bloqueados (R1/R2/R3)
-SAFETY_AVERSIVE_VALENCE_THRESHOLD = -0.6    # itens abaixo disso são bloqueados (R4)
+# Recalibrado com characterize.py (calibrate_guardrail_thresholds /
+# calibrate_valence_threshold) em 2026-09-16, contra o catálogo real pós
+# safety.auto_approve_clean_categories (DATA_BACKEND="json_export",
+# APPROVED_CATEGORIES = GAPED positive/neutral + DEAM/EMOPIA/MEDITATION_LOCAL/
+# MuVi auto-aprovados -- 3627 itens, 5 datasets; ver report_catalog_composition).
+# Recalibração anterior (-0.758/0.192) foi contra o catálogo então 100% GAPED
+# (210 itens) e ficou restritiva demais aqui: aplicada a este catálogo maior,
+# bloqueava 3607/3627 itens nos oitantes de baixa/alta energia (ainda >
+# CANDIDATE_POOL_SIZE, mas bem menos folga que o pretendido). Recalibrar de novo
+# sempre que APPROVED_CATEGORIES mudar -- a distribuição usada aqui reflete só
+# os 5 datasets acima.
+#   Arousal:  percentil 10 da distribuição real, pool mínimo garantido 12/12
+#             (CANDIDATE_POOL_SIZE) em toda a grade de diagnóstico.
+#   Valência: percentil 30 da distribuição real, mesmo pool mínimo garantido.
+SAFETY_AROUSAL_THRESHOLD = -0.526           # itens acima disso são bloqueados (R1/R2/R3)
+SAFETY_AVERSIVE_VALENCE_THRESHOLD = -0.175  # itens abaixo disso são bloqueados (R4)
 # Destinos plausíveis para a grade de diagnóstico/calibração (characterize.py): só
-# octantes de valência não-negativa faz sentido como ALVO de uma intervenção --
-# octantes 3-6 (valência negativa) nunca são um destino terapêutico razoável. Não
+# oitantes de valência positiva fazem sentido como alvo de uma intervenção
+# oitantes 3-6 (valência negativa) nunca são um destino terapêutico razoável. Não
 # restringe o CLI de produção (dest_oct ainda é livre 1-8 lá), só a varredura.
 ALLOWED_DEST_OCTANTS = (1, 2, 7, 8)
 
-# Fonte de dados: "csv" usa load_dataset() (dataset.csv, bancada de teste/protótipo);
-# "json_export" usa data_source.load_from_json_export() (arquivos locais gerados por
-# mongoexport --jsonArray, um por modalidade, ver JSON_EXPORT_DIR/JSON_EXPORT_PATHS --
-# sem exigir conexão nem pymongo instalado além do necessário para ler os arquivos);
-# "mongo" usa data_source.load_catalog() (banco real, read-only, conexão ao vivo).
-# "json_export": necessário para consumir o catálogo real (dbs/*.json) via
-# load_active_catalog(), e pré-requisito técnico de iter_raw_docs() -- usado por
-# characterize.py, safety.explore_taxonomy() e review_negative_tail.py, que lançam
-# exceção sobre DATA_BACKEND="csv". Trocar para "mongo" só depois de
-# MONGO_URI/MONGO_DB/MONGO_COLLECTIONS apontarem para um banco real.
+'''
+Fonte de dados: "csv" usa load_dataset() (dataset.csv, bancada de teste/protótipo);
+"json_export" usa data_source.load_from_json_export() (arquivos locais gerados por
+mongoexport --jsonArray, um por modalidade, ver JSON_EXPORT_DIR/JSON_EXPORT_PATHS --
+sem exigir conexão nem pymongo instalado além do necessário para ler os arquivos);
+"mongo" usa data_source.load_catalog() (banco real, read-only, conexão ao vivo).
+"json_export": necessário para consumir o catálogo real (dbs/*.json) via
+load_active_catalog(), e pré-requisito técnico de iter_raw_docs() -- usado por
+characterize.py, safety.explore_taxonomy() e review_negative_tail.py, que lançam
+exceção sobre DATA_BACKEND="csv". Trocar para "mongo" só depois de
+MONGO_URI/MONGO_DB/MONGO_COLLECTIONS apontarem para um banco real.
+'''
 DATA_BACKEND = "json_export"  # "csv", "json_export" ou "mongo"
 
 # Conexão Mongo (somente leitura)
@@ -156,12 +170,6 @@ NORMALIZATION_REFERENCE = {
     "DEAM":      {"raw_field": "staticAnnotations.valenceMean", "scale": (1, 9)},
     "OASIS":     {"raw_field": "ratings.valenceMean",           "scale": (1, 7)},
     "GAPED":     {"raw_field": "ratings.valenceMean",           "scale": (0, 100)},
-    # (-2, 2) empiricamente confirmado a partir de par (bruto, normalizado) real
-    # (valenceMean=1.13 -> valenceNormalized=0.565 = 1.13/2); NÃO é a escala 1-9
-    # tradicional do IAPS/SAM que se assumiria por analogia com DEAM/OASIS/GAPED.
-    # Confirmação vem de um único exemplo — antes de tratar como definitivo, rodar
-    # audit_dataset(collection, "EmoMadrid") sobre uma amostra maior (~30 itens) e
-    # confirmar taxa de discrepância ~0 (ver seção 2 do plano de revisões).
     "EmoMadrid": {"raw_field": "ratings.valenceMean",           "scale": (-2, 2)},
     # Sem campo valenceNormalized/arousalNormalized na estrutura do documento (só
     # valenceMean/arousalMean/valenceStd/arousalStd/sampleCount) — ausência
@@ -171,19 +179,16 @@ NORMALIZATION_REFERENCE = {
     # ("Valence/arousal are heuristic values in 1..9 scale normalized with
     # x' = (x - 5) / 4"), mais forte que inferência de literatura. Rótulos
     # atribuídos heuristicamente a partir de nome de arquivo/pasta, não por estudo
-    # psicométrico com participantes (diferente de DEAM/OASIS/GAPED/EmoMadrid) —
-    # ver CONFIDENCE_TIER abaixo.
+    # psicométrico com participantes (diferente de DEAM/OASIS/GAPED/EmoMadrid)
     "MEDITATION_LOCAL": {"raw_field": "staticAnnotations.valenceMean", "scale": (1, 9)},
-    # EMOPIA não tem campo contínuo confiável — tratado à parte em
-    # EMOPIA_QUADRANT_CENTROIDS. O valor armazenado em staticAnnotations É espúrio
-    # (contradiz tags/oitante/quadrante do próprio documento — ver correção crítica
-    # na seção 5 do plano de revisões) e nunca deve ser usado, nem como fallback.
+    # EMOPIA não tem campo contínuo confiável, então é tratado à parte em
+    # EMOPIA_QUADRANT_CENTROIDS.
 }
 NORMALIZATION_TOLERANCE = 0.05  # diferença máxima aceitável entre normalizado e recalculado
 
 # EMOPIA anota só quadrante (Q1-Q4), não V/A contínuo confiável. Este mapeamento
-# deixou de ser um fallback para valor ausente e passou a ser a ÚNICA fonte de
-# verdade para EMOPIA, sempre — ver data_source.normalize_audio_doc.
+# deixou de ser um fallback para valor ausente e passou a ser a única fonte de
+# verdade para EMOPIA, para todo caso. Ver data_source.normalize_audio_doc.
 EMOPIA_QUADRANT_CENTROIDS = {
     "Q1": (0.5, 0.5),    # alta valência, alto arousal
     "Q2": (-0.5, 0.5),   # baixa valência, alto arousal
@@ -193,40 +198,48 @@ EMOPIA_QUADRANT_CENTROIDS = {
 
 # Confiabilidade da origem do valor de V/A por dataset: "psychometric" (estudo com
 # participantes) vs "heuristic" (atribuído por julgamento/regra, não medido).
-# Metadado para relatório/ponderação futura — não bloqueante, não usado hoje na
-# seleção ou no treino.
+# Metadado para relatório/ponderação
 CONFIDENCE_TIER = {
     "DEAM": "psychometric", "OASIS": "psychometric", "GAPED": "psychometric",
     "EmoMadrid": "psychometric", "MuVi": "psychometric",
     "MEDITATION_LOCAL": "heuristic", "EMOPIA": "heuristic",
 }
 
-# Curadoria de segurança (vive só em código, sem alterar o banco)
+# Curadoria de segurança (só em código, sem alterar o banco)
 # Allowlist: só (dataset, category) explicitamente aprovados entram no catálogo.
 # Cresce conforme a taxonomia real é levantada e revisada (ver
 # safety.explore_taxonomy). Com o conjunto vazio, load_catalog() devolve um
-# DataFrame vazio: é o comportamento seguro por padrão, não um bug.
-# ATENÇÃO: não aprovar (EMOPIA, *) até confirmar, via
-# normalization.run_consistency_audit, que os itens de EMOPIA deixaram de ser
-# sinalizados como severos após a correção em data_source.normalize_audio_doc.
-#
-# Estado desta branch (ver Parte D do plano de consolidação): só GAPED está
-# populado até aqui, porque é o único dataset resolvido ESTRUTURALMENTE (taxonomia
-# fixa e documentada, seis categorias: Sn/Sp/H/A negativas, N/P positivas/neutras
-# -- aprovar só N/P não depende de revisão item a item). OASIS e EmoMadrid não têm
-# taxonomia de categoria dedicada a conteúdo negativo -- aprová-los aqui SEM ANTES
-# rodar review_negative_tail.py sobre a cauda de menor valência de cada categoria
-# arriscaria aprovar itens perturbadores que a denylist de keyword e a revisão
-# geométrica (Camadas 2/3) não capturam (ver docstring de review_negative_tail.py).
-# DEAM/MuVi/MEDITATION_LOCAL/EMOPIA-corrigido: mesmo processo de triagem por
-# keyword + amostragem que falta rodar para MuVi -- também pendente.
+# DataFrame vazio.
+
+# Estado desta branch: GAPED resolvido estruturalmente (taxonomia fixa e
+# documentada, em seis categorias: Sn/Sp/H/A negativas, N/P positivas/neutras --
+# aprovar só N/P não depende de revisão item a item); DEAM/MEDITATION_LOCAL/
+# EMOPIA/MuVi auto-aprovados via safety.auto_approve_clean_categories (sem hit de
+# denylist na categoria/subcategoria -- ver bloco abaixo). OASIS e EmoMadrid
+# continuam de fora: não têm taxonomia de categoria dedicada a conteúdo negativo
+# -- aprová-los sem antes rodar review_negative_tail.py sobre a cauda de menor
+# valência de cada categoria arriscaria aprovar itens problemáticos que a
+# denylist de keyword e a revisão geométrica (Camadas 2/3) não capturam (ver
+# docstring de review_negative_tail.py); revisão manual pendente para os dois.
+
 APPROVED_CATEGORIES = {
-    # GAPED -- proveniência: regra estrutural da taxonomia documentada do dataset
-    # (seção 4.4 do plano de consolidação), não revisão item a item. "neutral" = N,
-    # "positive" = P. NÃO aprovar animal_mistreatment (A), human_concern (H),
-    # snakes (Sn), spiders (Sp) -- são as quatro categorias negativas da taxonomia.
+    # GAPED - proveniência: regra estrutural da taxonomia documentada do dataset, não
+    # revisão item a item. "neutral" = N, "positive" = P. Não aprovar
+    # animal_mistreatment (A), human_concern (H), snakes (Sn), spiders (Sp):
+    # são as quatro categorias negativas da taxonomia.
     ("GAPED", "neutral"),
     ("GAPED", "positive"),
+
+    # Auto-aprovados via safety.auto_approve_clean_categories em 2026-09-16:
+    # datasets sem evidência de falha das Camadas 2-4 (DEAM, MEDITATION_LOCAL,
+    # EMOPIA, MuVi -- diferente de OASIS/EmoMadrid, onde review_negative_tail.py
+    # encontrou casos que a denylist/filtro geométrico deixaram passar), única
+    # categoria de cada um, sem hit de SAFETY_DENYLIST_KEYWORDS no nome de
+    # categoria/subcategoria. Camadas 2/3/4 seguem ativas item a item.
+    ("DEAM", "music"),
+    ("EMOPIA", "music"),
+    ("MEDITATION_LOCAL", "music"),
+    ("MuVi", "music_video"),
 }
 
 # Denylist de palavras-chave, aplicada a nome/tags/category.
@@ -244,7 +257,17 @@ BLOCKED_ITEM_IDS = set()
 SAFETY_MIN_VALENCE_REVIEW = -0.6
 
 # Cold-start (heurística -> DQN)
-WARMUP_INTERACTIONS = 50    # num. de feedbacks reais até confiar totalmente no DQN
+# Precisa ser maior que BATCH_SIZE com margem: entre o feedback BATCH_SIZE e
+# WARMUP_INTERACTIONS, a rede já treina mas o score híbrido ainda mistura a
+# heurística. Se WARMUP < BATCH_SIZE, haveria uma janela em que w=1.0 (confiança
+# total na DQN) antes de qualquer passo de gradiente ter ocorrido. Recalibrado
+# junto com BATCH_SIZE=8 (antes: 50).
+WARMUP_INTERACTIONS = 45    # num. de feedbacks reais até confiar totalmente no DQN
+assert WARMUP_INTERACTIONS > BATCH_SIZE, (
+    f"WARMUP_INTERACTIONS ({WARMUP_INTERACTIONS}) deve ser maior que BATCH_SIZE "
+    f"({BATCH_SIZE}): caso contrário existe uma janela em que o score híbrido já "
+    f"confia totalmente na DQN (w=1.0) antes dela ter dado qualquer passo de treino."
+)
 
 # Escala de recompensa / feedback (cabeça categórica)
 # FEEDBACK_LEVELS é a única fonte de verdade: a rede (n° de saídas), o texto do CLI, o
@@ -297,24 +320,25 @@ P_EXPLORE_SLOT = 0.5        # probabilidade de um dos slots ser exploratório
 MMR_LAMBDA = 0.7            # 0.7*relevância - 0.3*similaridade (diversidade da lista)
 FATIGUE_LAMBDA = 0.5        # peso máximo da penalidade de fadiga
 FATIGUE_HALFLIFE = 10       # em nº de interações; meia-vida do decaimento da penalidade
-# Nº mínimo de RODADAS EXECUTADAS antes de um item poder reaparecer (bloqueio
-# RÍGIDO, aplicado no pool antes da pontuação -- ver FatigueTracker.blocked_mask).
+# Nº mínimo de rodadas executadas antes de um item poder reaparecer (bloqueio
+# rígido, aplicado no pool antes da pontuação -- ver FatigueTracker.blocked_mask).
 # A penalidade suave acima (FATIGUE_LAMBDA/FATIGUE_HALFLIFE) nunca garante
 # espaçamento por construção (fatigue_diagnostics.py mediu, contra o catálogo real,
 # que em 0% dos contextos a penalidade máxima sequer supera o gap de score real
-# entre 1º e 2º colocado -- ou seja, ela nunca tem força para trocar o item
+# entre 1º e 2º colocado; ou seja, ela nunca tem força para trocar o item
 # escolhido sozinha).
-#
-# IMPORTANTE: o cooldown só é aplicado ao item que o usuário de fato EXECUTOU
+
+# Importante: o cooldown só é aplicado ao item que o usuário de fato executou
 # (FatigueTracker.mark_executed, chamado em _run_interaction quando a escolha não
 # é "[0] Não executei"), não a todos os itens apenas exibidos na lista. Itens
 # mostrados em slots que o usuário não escolheu, ou rodadas onde nada foi
 # executado, não entram em cooldown. O contador de rodadas (FatigueTracker.counter)
 # continua avançando a cada chamada de recommend() (FatigueTracker.advance_round),
-# independente de execução -- só o registro de "quem está em cooldown" é que fica
+# independente de execução - só o registro de "quem está em cooldown" é que fica
 # condicionado à execução. Ex.: item executado na rodada t -> bloqueado em
 # t+1..t+(FATIGUE_MIN_GAP-1) -> elegível de novo a partir de t+FATIGUE_MIN_GAP,
 # ainda com a penalidade suave decrescente por cima.
+
 FATIGUE_MIN_GAP = 10
 TOP_K = 3                   # itens recomendados por vez
 
@@ -926,7 +950,22 @@ class Recommender:
     def catalog_coverage(self) -> float:
         return len(self.recommended_items) / len(self.df)
 
-    def recommend(self, curr_oct: int, dest_oct: int, time_avail: float, k: int = TOP_K) -> list[dict]:
+    def recommend(self, curr_oct: int, dest_oct: int, time_avail: float, k: int = TOP_K,
+                  deterministic: bool = False, register_fatigue: bool = True) -> list[dict]:
+        """
+        deterministic=True: seleção puramente por argmax do score ajustado -- sem
+        softmax no slot exploratório, sem embaralhamento da cauda. Usado SOMENTE por
+        diagnósticos que precisam isolar sensibilidade ao estado da variação
+        estocástica (ver check_state_sensitivity). O caminho de produção nunca passa
+        True (fica no padrão False).
+
+        register_fatigue=False: não avança o contador de rodadas do FatigueTracker
+        -- evita que uma avaliação que varre centenas de contextos infle o `counter`
+        usado para medir espaçamento (FATIGUE_MIN_GAP), contaminando checks
+        subsequentes na mesma instância de Recommender. O caminho de produção sempre
+        usa o padrão True: cada recommend() de fato exibido ao usuário deve contar
+        como uma rodada.
+        """
         # Avança a rodada de fadiga logo no início -- não no fim. O item
         # eventualmente executado só é marcado (fatigue.mark_executed) DEPOIS que
         # esta função já retornou (em _run_interaction, quando o usuário escolhe
@@ -935,7 +974,8 @@ class Recommender:
         # desbloqueio em 1 rodada a mais do que FATIGUE_MIN_GAP pede. Avançando
         # aqui, o contador usado na pontuação desta rodada é o mesmo que
         # mark_executed() vai usar logo depois, até a próxima chamada.
-        self.fatigue.advance_round()
+        if register_fatigue:
+            self.fatigue.advance_round()
 
         if TIME_FILTER_ENABLED:
             eligible = self.df.index[self.df["Duracao"] <= time_avail].to_numpy(dtype=int)
@@ -973,7 +1013,9 @@ class Recommender:
         reward_std = np.sqrt((q_dist * (self.agent.support_np - q_values[:, None]) ** 2).sum(axis=1))
 
         pool_vectors = self.feature_space.item_features(pool_idx)
-        positions, slot_types, propensities = self._select_slots(adjusted, pool_vectors, k)
+        positions, slot_types, propensities = self._select_slots(
+            adjusted, pool_vectors, k, deterministic=deterministic
+        )
 
         results = []
         for pos, slot_type, propensity in zip(positions, slot_types, propensities):
@@ -1090,8 +1132,16 @@ class Recommender:
         risk_penalty = RISK_AVERSION_LAMBDA * w * q_dist[:, 0]
         return base - risk_penalty
 
-    def _select_slots(self, adjusted: np.ndarray, pool_vectors: np.ndarray, k: int):
+    def _select_slots(self, adjusted: np.ndarray, pool_vectors: np.ndarray, k: int,
+                       deterministic: bool = False):
         """
+        deterministic=True: desliga o slot exploratório (e, por consequência, o
+        embaralhamento da cauda, que só roda quando há slot exploratório) -- só
+        restam o slot 1 (sempre argmax, já determinístico) e os slots MMR
+        (determinísticos condicionados às escolhas anteriores). Usado por
+        diagnósticos que precisam isolar sensibilidade ao estado do ruído do
+        softmax/sorteio de posição. Ver Recommender.recommend().
+
         Slot 1: SEMPRE o argmax determinístico de `adjusted` -- o item de maior score
         pós-fadiga/risco no pool atual, inclusive durante rodadas de exploração. Nunca
         é sorteado. O espaçamento de recomendações (FATIGUE_MIN_GAP) já está garantido
@@ -1134,7 +1184,7 @@ class Recommender:
         remaining.remove(pos)
 
         has_explore = False
-        if remaining and len(chosen) < k and random.random() < P_EXPLORE_SLOT:
+        if not deterministic and remaining and len(chosen) < k and random.random() < P_EXPLORE_SLOT:
             probs = _softmax(adjusted[remaining], EXPLORE_TEMPERATURE)
             pos = int(np.random.choice(remaining, p=probs))
             chosen.append(pos)
@@ -1181,41 +1231,85 @@ e circularidade metodológica."""
 # tanto pelo guardrail de produção quanto pelo simulador abaixo.
 
 
-def _simulate(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> tuple[float, int]:
+def _p_execution(curr_oct: int, item: pd.Series) -> float:
+    """Probabilidade de execução: baixa energia tende a rejeitar itens
+    ativadores/longos. Extraído de _simulate -- parte determinística (não depende
+    de amostragem), reaproveitada pelo oráculo de regret (expected_reward_proxy),
+    que precisa do valor esperado sem rodar Monte Carlo."""
+    p = 1.0
+    if curr_oct in LOW_ENERGY_OCTANTS:
+        if float(item["Arousal"]) > 0.5:
+            p -= 0.3
+        if float(item["Duracao"]) > 30:
+            p -= 0.2
+    return max(0.05, p)
+
+
+def _alignment_score(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> float:
+    """Alinhamento entre a mudança desejada (dest - curr) e o vetor (V, A) do item,
+    mais bônus contextual -- SEM o ruído gaussiano e SEM a quantização que
+    _simulate aplica em cima disso. Extraído de _simulate pelo mesmo motivo de
+    _p_execution: é o componente que o oráculo de regret precisa isolado."""
     curr_v, curr_a = OCTANT_MAP[curr_oct]
     dest_v, dest_a = OCTANT_MAP[dest_oct]
     item_v, item_a = float(item["Valencia"]), float(item["Arousal"])
-    duration = float(item["Duracao"])
 
-    # Probabilidade de execução: baixa energia tende a rejeitar itens ativadores/longos.
-    p_execution = 1.0
-    if curr_oct in LOW_ENERGY_OCTANTS:
-        if item_a > 0.5:
-            p_execution -= 0.3
-        if duration > 30:
-            p_execution -= 0.2
-    p_execution = max(0.05, p_execution)
-    if random.random() > p_execution:
-        return REWARD_SUPPORT[1], curr_oct   # equivalente a "ruim": não chegou a executar a intervenção
-
-    # Alinhamento entre a mudança desejada (dest - curr) e o vetor (V, A) do item.
     delta_target = np.array([dest_v - curr_v, dest_a - curr_a])
     item_vec = np.array([item_v, item_a])
     norm = np.linalg.norm(delta_target) * np.linalg.norm(item_vec)
     alignment = float(np.dot(delta_target, item_vec) / norm) if norm > 1e-8 else 0.0
 
-    score = 0.5 + 0.4 * alignment
-    score += bonus_fn(curr_oct, item)
-    score += random.gauss(0, 0.05)
-    score = max(0.0, min(1.0, score))
-    next_oct = dest_oct if score > 0.65 else curr_oct
+    score = 0.5 + 0.4 * alignment + bonus_fn(curr_oct, item)
+    return max(0.0, min(1.0, score))
+
+
+def _holdout_bonus(octant: int, item: pd.Series) -> float:
+    """Bônus contextual do perfil holdout -- extraído do closure interno de
+    simulate_feedback_holdout para ser função de módulo, reaproveitável pelo
+    oráculo de regret (oracle_pick), que precisa ser fiel ao MESMO bônus do
+    simulador que está avaliando, não a uma fórmula diferente.
+
+    Dois perfis, escolhidos automaticamente pela presença da coluna `category`
+    (só existe em itens do catálogo real -- ver data_source._to_feature_space_schema
+    -- nunca no CSV sintético): catálogo real usa bônus por `category`
+    ("positive"/"neutral"); CSV sintético usa as regras originais por Tipo/Indoor.
+    Ver docstring de simulate_feedback_holdout para a justificativa completa."""
+    b = 0.0
+    category = item.get("category")
+    if category is not None:
+        if octant in LOW_ENERGY_OCTANTS and category == "positive":
+            b += 0.1
+        if octant in HIGH_ENERGY_OCTANTS and category == "neutral":
+            b += 0.1
+        if octant == 2 and category == "neutral":
+            b += 0.05
+        return b
+    if octant in LOW_ENERGY_OCTANTS and item["Tipo"] == "Mindfulness":
+        b += 0.1
+    if octant in HIGH_ENERGY_OCTANTS and item["Tipo"] == "Imagem":
+        b += 0.1
+    if octant == 2 and item["Indoor"] == 1:
+        b += 0.05
+    return b
+
+
+def _simulate(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> tuple[float, int]:
+    """Comportamento idêntico à versão pré-refatoração -- só reorganizado para usar
+    _p_execution/_alignment_score em vez de código inline (ver as duas acima)."""
+    p_execution = _p_execution(curr_oct, item)
+    if random.random() > p_execution:
+        return REWARD_SUPPORT[1], curr_oct   # equivalente a "ruim": não chegou a executar a intervenção
+
+    score = _alignment_score(curr_oct, dest_oct, item, bonus_fn)
+    score_noisy = max(0.0, min(1.0, score + random.gauss(0, 0.05)))
+    next_oct = dest_oct if score_noisy > 0.65 else curr_oct
 
     # Recompensa latente contínua em [-1, 1] (score=0 -> -1, score=0.5 -> 0, score=1 ->
     # 1), comprimida por CENTRAL_BIAS_FACTOR para emular a relutância de usuários reais
     # em marcar os extremos de uma escala Likert, e então quantizada no nível de
     # REWARD_SUPPORT mais próximo — o simulador emite o mesmo formato discreto que o
     # feedback real, não um valor contínuo que a rede nunca veria em produção.
-    latent_reward = (2.0 * score - 1.0) * CENTRAL_BIAS_FACTOR
+    latent_reward = (2.0 * score_noisy - 1.0) * CENTRAL_BIAS_FACTOR
     level_idx = int(np.argmin(np.abs(_REWARD_SUPPORT_ARR - latent_reward)))
     reward = REWARD_SUPPORT[level_idx]
     return reward, next_oct
@@ -1260,30 +1354,12 @@ def simulate_feedback_holdout(curr_oct: int, dest_oct: int, item: pd.Series) -> 
       - CSV sintético (sem `category`): mantém as regras originais por
         Tipo/Indoor, sem mudança -- preserva a bancada fixa e conhecida de quem
         rodar com DATA_BACKEND="csv".
-    """
-    def bonus(octant: int, item_: pd.Series) -> float:
-        b = 0.0
-        category = item_.get("category")
-        if category is not None:
-            # Catálogo real: "positive" anima um estado de baixa energia;
-            # "neutral" acalma um estado de hiperativação, sem estimular mais.
-            if octant in LOW_ENERGY_OCTANTS and category == "positive":
-                b += 0.1
-            if octant in HIGH_ENERGY_OCTANTS and category == "neutral":
-                b += 0.1
-            if octant == 2 and category == "neutral":
-                b += 0.05
-            return b
-        # CSV sintético: regras originais, inalteradas.
-        if octant in LOW_ENERGY_OCTANTS and item_["Tipo"] == "Mindfulness":
-            b += 0.1
-        if octant in HIGH_ENERGY_OCTANTS and item_["Tipo"] == "Imagem":
-            b += 0.1
-        if octant == 2 and item_["Indoor"] == 1:
-            b += 0.05
-        return b
 
-    return _simulate(curr_oct, dest_oct, item, bonus)
+    Usa _holdout_bonus (função de módulo, não um closure local) -- reaproveitada
+    também pelo oráculo de regret (oracle_pick), que precisa ser fiel a este MESMO
+    bônus, não a uma fórmula diferente.
+    """
+    return _simulate(curr_oct, dest_oct, item, _holdout_bonus)
 
 
 # Avaliação offline - Bancada de teste
@@ -1295,37 +1371,124 @@ sintético em avaliação — nunca para treinar o modelo de produção (ver se�
 CONTEXT_DURATIONS = (5, 15, 30, 60)
 
 
+def _full_time() -> float:
+    """Maior bucket de CONTEXT_DURATIONS -- usado por diagnósticos que precisam que
+    o filtro de tempo (quando TIME_FILTER_ENABLED=True) não recorte o pool."""
+    return max(CONTEXT_DURATIONS)
+
+
+def check_proximity_to_target(recommender: Recommender, df: pd.DataFrame, k: int = TOP_K) -> None:
+    """
+    [2] As recomendações devem estar mais próximas do ponto-alvo (plano V-A) que a
+    média do catálogo elegível -- a mesma grandeza que a política de fato otimiza
+    (ver Recommender._candidate_pool/target_point). Substitui a antiga comparação de
+    valência bruta contra um único par (curr=5, dest=7): aquele teste não discriminava
+    nada quando a valência-alvo ficava perto da média do catálogo, e passou a reportar
+    FALHOU sobre comportamento correto assim que a composição do catálogo mudou
+    (recomendações corretamente próximas de um alvo abaixo da média do catálogo
+    pareciam "piores que a média", sem haver erro). Roda sobre toda a grade
+    curr × ALLOWED_DEST_OCTANTS, não um par escolhido a dedo.
+    """
+    passed, total = 0, 0
+    worst = None
+    t = _full_time()
+    for curr in range(1, 9):
+        for dest in ALLOWED_DEST_OCTANTS:
+            results = recommender.recommend(curr, dest, t, k=k)
+            if not results:
+                continue
+            point = target_point(curr, dest, ISO_ALPHA)
+            d_rec = float(np.mean([
+                np.hypot(r["valencia"] - point[0], r["arousal"] - point[1])
+                for r in results
+            ]))
+            d_cat = float(np.mean(distance_to_point(df, point)))
+            total += 1
+            if d_rec < d_cat:
+                passed += 1
+            elif worst is None or (d_rec - d_cat) > worst[0]:
+                worst = (d_rec - d_cat, curr, dest)
+
+    status = "OK" if total and passed == total else f"{total - passed} par(es) falhando"
+    print(f"[2] Proximidade ao alvo: {passed}/{total} pares (curr,dest) com "
+          f"recomendação mais próxima do alvo que a média do catálogo ({status})")
+    if worst:
+        print(f"    pior caso: curr={worst[1]} dest={worst[2]} "
+              f"(recomendação {worst[0]:.3f} mais LONGE do alvo que a média)")
+
+
+def check_state_sensitivity(recommender: Recommender) -> None:
+    """
+    [3] Sensibilidade ao oitante atual, medida em modo DETERMINÍSTICO -- do contrário
+    o resultado é indistinguível do ruído do softmax/MMR já medido pelo check [5].
+    Três medições:
+      (a) controle: chamada idêntica, determinística -> deve dar 0% de mudança
+      (b) curr varia DENTRO do mesmo grupo de guardrail (restrito/livre)
+      (c) curr varia ENTRE grupos de guardrail
+    register_fatigue=False em toda chamada: isola o efeito do ESTADO (curr_oct) do
+    efeito colateral de o próprio ato de recomendar avançar o contador de fadiga, que
+    mudaria o pool entre chamadas mesmo com curr_oct igual.
+    """
+    def _lists_differ(a, b):
+        return [x["item_idx"] for x in a] != [x["item_idx"] for x in b]
+
+    def _guardrail_group(octant):
+        return "restrito" if octant in (LOW_ENERGY_OCTANTS + HIGH_ENERGY_OCTANTS) else "livre"
+
+    t = _full_time()
+    kw = {"deterministic": True, "register_fatigue": False}
+
+    # (a) controle
+    control_diff = sum(
+        _lists_differ(recommender.recommend(5, 7, t, **kw),
+                      recommender.recommend(5, 7, t, **kw))
+        for _ in range(10)
+    )
+    print(f"[3a] Controle (chamada idêntica, determinística): {control_diff}/10 "
+          f"diferentes (esperado: 0)")
+
+    within, within_total, between, between_total = 0, 0, 0, 0
+    for dest in ALLOWED_DEST_OCTANTS:
+        base = recommender.recommend(1, dest, t, **kw)
+        for curr in range(2, 9):
+            other = recommender.recommend(curr, dest, t, **kw)
+            if _guardrail_group(curr) == _guardrail_group(1):
+                within_total += 1
+                within += _lists_differ(base, other)
+            else:
+                between_total += 1
+                between += _lists_differ(base, other)
+
+    print(f"[3b] curr varia DENTRO do mesmo grupo de guardrail: {within}/{within_total}")
+    print(f"[3c] curr varia ENTRE grupos de guardrail: {between}/{between_total}")
+    print("     (3b baixo = o estado atual influencia pouco além do guardrail; "
+          "depende de ISO_ALPHA e do peso da DQN no score híbrido)")
+
+
 def sanity_checks(recommender: Recommender, df: pd.DataFrame) -> None:
     # Bateria de checagens estruturais sobre o pipeline de recomendação.
     print("- Sanity checks")
 
-    # 1. Nenhuma recomendação excede o tempo disponível.
-    violations = sum(
-        1
-        for time_avail in CONTEXT_DURATIONS
-        for curr in range(1, 9)
-        for dest in range(1, 9)
-        for item in recommender.recommend(curr, dest, time_avail)
-        if item["duracao"] > time_avail
-    )
-    print(f"[1] Recomendações excedendo o tempo disponível: {violations} (esperado: 0)")
+    # 1. Nenhuma recomendação excede o tempo disponível. Só testa algo enquanto
+    # TIME_FILTER_ENABLED=True -- desligada, a flag já garante que Duracao nunca é
+    # filtrada (ver Recommender.recommend), e o check sempre "passaria" sem testar
+    # nada, o que é enganoso reportado como "0 (esperado: 0)".
+    if TIME_FILTER_ENABLED:
+        violations = sum(
+            1
+            for time_avail in CONTEXT_DURATIONS
+            for curr in range(1, 9)
+            for dest in range(1, 9)
+            for item in recommender.recommend(curr, dest, time_avail)
+            if item["duracao"] > time_avail
+        )
+        print(f"[1] Recomendações excedendo o tempo disponível: {violations} (esperado: 0)")
+    else:
+        print("[1] Recomendações excedendo o tempo disponível: check INATIVO "
+              "(TIME_FILTER_ENABLED=False -- Duracao não é filtrada nesta versão)")
 
-    # 2. curr=5, dest=7: valência média das recomendações supera a média do catálogo.
-    catalog_mean = df["Valencia"].mean()
-    recs = recommender.recommend(5, 7, 60)
-    rec_mean = np.mean([item["valencia"] for item in recs]) if recs else float("nan")
-    status = "OK" if recs and rec_mean > catalog_mean else "FALHOU"
-    print(f"[2] Valência média recomendada={rec_mean:.3f} vs catálogo={catalog_mean:.3f} ({status})")
-
-    # 3. Mudar curr_oct (mantendo o resto) altera a lista em fração significativa dos casos.
-    changed, total = 0, 0
-    for dest in range(1, 9):
-        base = {item["item_idx"] for item in recommender.recommend(1, dest, 60)}
-        for curr in range(2, 9):
-            other = {item["item_idx"] for item in recommender.recommend(curr, dest, 60)}
-            total += 1
-            changed += other != base
-    print(f"[3] Listas alteradas ao mudar o oitante atual: {changed}/{total}")
+    check_proximity_to_target(recommender, df)
+    check_state_sensitivity(recommender)
 
     # 4. Guardrail bloqueia uma fração de itens para oitantes de baixa energia. Sem
     # valor fixo esperado: o guardrail agora tem 4 regras (R1-R4, ver
@@ -1542,6 +1705,162 @@ def calibration_check(agent: Agent, df: pd.DataFrame, feature_space: FeatureSpac
     print(f"  Erro de calibração esperado (ECE) = {ece:.3f}")
 
 
+# Regret cumulativo (agente vs. oráculo) -- ver garantia de isolamento abaixo.
+#
+# GARANTIA INVIOLÁVEL: o código de regret desta seção NUNCA chama
+# Recommender.recommend(), nunca importa nem instancia FatigueTracker, e nunca lê
+# ou escreve last_seen/counter de fadiga. Cada episódio de regret é independente
+# dos demais (sem estado de cooldown entre episódios) -- mesma filosofia que
+# baselines() já usa (pick_agent seleciona via agent.q_values() diretamente,
+# nunca via Recommender). Se esta seção precisar "escolher um favorito" (como o
+# oráculo, abaixo), essa escolha é local ao cálculo do regret, descartada ao
+# final do episódio, e nunca compartilha código, estado ou instância com o
+# Recommender/FatigueTracker usados por main()/CLI de produção.
+
+def expected_reward_proxy(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> float:
+    """
+    Valor esperado aproximado da recompensa do simulador holdout para um item, sem
+    amostragem estocástica: ignora o ruído gaussiano (média zero, não desloca o
+    valor esperado) e aproxima a quantização pelo nível de REWARD_SUPPORT mais
+    próximo do valor médio, em vez de calcular E[quantize(X)] exatamente. Usado
+    SOMENTE pelo oráculo de regret (oracle_pick) -- nunca pela política de produção.
+    """
+    p_exec = _p_execution(curr_oct, item)
+    score = _alignment_score(curr_oct, dest_oct, item, bonus_fn)
+    latent_if_executed = (2.0 * score - 1.0) * CENTRAL_BIAS_FACTOR
+    reward_if_executed = REWARD_SUPPORT[
+        int(np.argmin(np.abs(_REWARD_SUPPORT_ARR - latent_if_executed)))
+    ]
+    return p_exec * reward_if_executed + (1 - p_exec) * REWARD_SUPPORT[1]
+
+
+def oracle_pick(df: pd.DataFrame, eligible: np.ndarray, curr_oct: int, dest_oct: int):
+    """
+    Item de maior valor esperado (proxy determinístico) entre os elegíveis -- o
+    "melhor possível" contra o qual medir regret. Usa _holdout_bonus, o MESMO bônus
+    de simulate_feedback_holdout, para o oráculo ser fiel ao holdout real, não a
+    uma fórmula diferente.
+    """
+    best_item, best_value = None, -np.inf
+    for item_idx in eligible:
+        value = expected_reward_proxy(curr_oct, dest_oct, df.loc[item_idx], _holdout_bonus)
+        if value > best_value:
+            best_item, best_value = item_idx, value
+    return best_item, best_value
+
+
+def regret_curve(df: pd.DataFrame, feature_space: FeatureSpace,
+                  n_episodes: int = 1000, seed: int = SEED) -> dict:
+    """
+    Curva de regret cumulativo do agente contra o oráculo, sobre episódios
+    independentes (sem estado entre eles -- mesmo padrão de baselines()). NÃO usa
+    Recommender, NÃO usa FatigueTracker, NÃO acumula cooldown entre episódios (ver
+    garantia de isolamento no topo desta seção).
+    """
+    set_seed(seed)
+    agent = Agent(df, feature_space)
+
+    per_episode_regret = []
+    for _ in range(n_episodes):
+        curr, dest, time_avail = _random_context()
+        eligible = df.index[df["Duracao"] <= time_avail].to_numpy(dtype=int) \
+            if TIME_FILTER_ENABLED else df.index.to_numpy(dtype=int)
+        if len(eligible) == 0:
+            continue
+
+        _, oracle_value = oracle_pick(df, eligible, curr, dest)
+
+        user_state = feature_space.user_state(curr, dest, time_avail)
+        agent_item = int(eligible[np.argmax(agent.q_values(user_state, eligible))])
+        agent_reward, next_oct = simulate_feedback_holdout(curr, dest, df.loc[agent_item])
+
+        per_episode_regret.append(oracle_value - agent_reward)
+
+        next_state = feature_space.user_state(next_oct, dest, time_avail)
+        agent.learn_from_feedback(user_state, agent_item, agent_reward, next_state)
+
+    cumulative = np.cumsum(per_episode_regret)
+    return {
+        "per_episode_regret": per_episode_regret,
+        "cumulative_regret": cumulative.tolist(),
+        "final_cumulative_regret": float(cumulative[-1]) if len(cumulative) else 0.0,
+        "regret_last_100_mean": float(np.mean(per_episode_regret[-100:])) if len(per_episode_regret) >= 100 else None,
+    }
+
+
+def report_regret(df: pd.DataFrame, feature_space: FeatureSpace, n_episodes: int = 1000) -> None:
+    """Ressalva: _holdout_bonus (usado tanto pelo simulador quanto pelo oráculo) usa
+    `category` contra o catálogo real e Tipo/Indoor contra o CSV sintético (ver sua
+    docstring) -- o regret medido aqui é fiel ao MESMO simulador usado em baselines()
+    e deve ser lido com a mesma ressalva: reflete o perfil de recompensa desse
+    simulador, não uma verdade de usuário real."""
+    print("=== Regret cumulativo (agente vs. oráculo, simulador holdout) ===")
+    result = regret_curve(df, feature_space, n_episodes)
+    print(f"  Regret cumulativo final: {result['final_cumulative_regret']:.2f} "
+          f"em {n_episodes} episódios")
+    print(f"  Regret médio por episódio, primeiros 100: "
+          f"{np.mean(result['per_episode_regret'][:100]):.4f}")
+    if result["regret_last_100_mean"] is not None:
+        print(f"  Regret médio por episódio, últimos 100: "
+              f"{result['regret_last_100_mean']:.4f}")
+        print("  (queda entre os dois números = evidência de aprendizado/convergência;"
+              " estagnado = platô)")
+
+
+# Heatmap 8x8 -- diferente do regret acima, USA Recommender.recommend() de
+# propósito: o objetivo aqui é medir o comportamento real de produção (guardrail,
+# fadiga, MMR inclusos) por região do plano afetivo, não isolar o aprendizado do
+# agente do resto do pipeline.
+
+def octant_heatmap(df: pd.DataFrame, feature_space: FeatureSpace, agent: Agent,
+                    n_episodes_per_cell: int = 15) -> np.ndarray:
+    """
+    Recompensa média por par (oitante atual, oitante desejado), usando o
+    Recommender de produção de fato (guardrail, fadiga, MMR inclusos). Uma
+    instância NOVA de Recommender por célula -- fadiga não vaza entre células (mas
+    o cooldown DENTRO da mesma célula, ao longo de várias interações simuladas com
+    o mesmo par oitante-atual/desejado, é mantido de propósito -- reflete a
+    experiência real de alguém que pede a mesma coisa várias vezes).
+    """
+    heatmap = np.full((8, 8), np.nan, dtype=np.float32)
+    time_avail = feature_space.max_duration  # tempo "pleno" -- ver TIME_FILTER_ENABLED
+
+    for curr in range(1, 9):
+        for dest in range(1, 9):
+            recommender = Recommender(df, feature_space, agent)  # fadiga limpa
+            rewards = []
+            for _ in range(n_episodes_per_cell):
+                results = recommender.recommend(curr, dest, time_avail)
+                if not results:
+                    continue
+                top1 = results[0]
+                reward, _ = simulate_feedback_holdout(curr, dest, df.loc[top1["item_idx"]])
+                rewards.append(reward)
+            if rewards:
+                heatmap[curr - 1, dest - 1] = np.mean(rewards)
+
+    return heatmap
+
+
+def report_octant_heatmap(df: pd.DataFrame, feature_space: FeatureSpace, agent: Agent) -> None:
+    """`agent` deve ser o mesmo já treinado usado no resto da avaliação (o
+    trained_agent retornado por baselines()), não um agente recém-inicializado --
+    senão o heatmap mede uma rede aleatória, não o sistema de fato."""
+    print("\n=== Heatmap 8x8: recompensa média por (oitante atual, oitante desejado) ===")
+    hm = octant_heatmap(df, feature_space, agent)
+    header = "curr\\dest " + " ".join(f"{d:>6}" for d in range(1, 9))
+    print(header)
+    for curr in range(1, 9):
+        row = " ".join(
+            f"{hm[curr-1, d-1]:>6.2f}" if not np.isnan(hm[curr-1, d-1]) else "   n/a"
+            for d in range(1, 9)
+        )
+        print(f"{curr:>9} {row}")
+    print(f"\n  Pior célula: {np.nanmin(hm):.2f}  |  Melhor célula: {np.nanmax(hm):.2f}")
+    print(f"  Desvio-padrão entre células: {np.nanstd(hm):.3f} "
+          "(alto = desempenho desigual pelo plano afetivo)")
+
+
 # CLI interativo e ponto de entrada
 
 def _print_octant_map() -> None:
@@ -1723,18 +2042,18 @@ def _run_offline_evaluation() -> None:
     # Segue DATA_BACKEND como qualquer outro ponto de carga do catálogo (main(),
     # characterize.py, fatigue_diagnostics.py, review_negative_tail.py) -- não é
     # mais um caso especial que ignora a config. Com DATA_BACKEND="json_export"
-    # (padrão atual), roda contra o catálogo real (~210 itens do GAPED, todos
-    # Tipo="Imagem"/Indoor=0 -- ver data_source.py). Para reproduzir a bancada
-    # fixa sobre o CSV sintético (comportamento antigo desta função), defina
+    # (padrão atual), roda contra o catálogo real (GAPED + DEAM/EMOPIA/
+    # MEDITATION_LOCAL/MuVi auto-aprovados, ver APPROVED_CATEGORIES -- Indoor=0
+    # para todo item real, ver data_source.py). Para reproduzir a bancada fixa
+    # sobre o CSV sintético (comportamento antigo desta função), defina
     # DATA_BACKEND = "csv" antes de rodar -- load_dataset()/o backend "csv" em
     # load_active_catalog() continuam intactos.
     #
-    # Ressalva herdada, não corrigida aqui: o guardrail (check [4] de
-    # sanity_checks) usa SAFETY_AROUSAL_THRESHOLD/SAFETY_AVERSIVE_VALENCE_THRESHOLD,
-    # ainda não recalibrados para este catálogo curado -- ver comentário "AINDA NÃO
-    # CALIBRADOS..." acima da definição das duas constantes. O check imprime
-    # contagem e limiares ao vivo, sem valor fixo esperado; não quebra, só não
-    # valida calibração.
+    # O guardrail (check [4] de sanity_checks) usa SAFETY_AROUSAL_THRESHOLD/
+    # SAFETY_AVERSIVE_VALENCE_THRESHOLD, recalibrados via characterize.py contra
+    # este catálogo curado -- ver comentário de proveniência acima da definição
+    # das duas constantes. O check imprime contagem e limiares ao vivo, sem valor
+    # fixo esperado.
     set_seed(SEED)
     df = load_active_catalog()
     if len(df) == 0:
@@ -1762,6 +2081,10 @@ def _run_offline_evaluation() -> None:
     trained_agent = baselines(df, feature_space, n_episodes=3000)
     print()
     calibration_check(trained_agent, df, feature_space)
+    print()
+    report_regret(df, feature_space, n_episodes=1000)
+    print()
+    report_octant_heatmap(df, feature_space, trained_agent)
 
 
 if __name__ == "__main__":

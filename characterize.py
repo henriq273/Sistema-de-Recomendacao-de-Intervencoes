@@ -36,6 +36,110 @@ import safety
 import sistema_de_recomendacao_v3 as sysrec
 
 
+def report_catalog_composition(df: pd.DataFrame) -> None:
+    """
+    Composição do catálogo pós-curadoria, por dataset e por modalidade. Responde
+    se o catálogo está dominado por uma única fonte -- o que distorceria cobertura,
+    diversidade, baselines e a calibração do guardrail (percentis de uma
+    distribuição dominada por um dataset não representam o catálogo como um todo).
+
+    Complementa (não duplica) a seção E (report_curation_survival), que já compara
+    bruto vs. curado por dataset usando safety.explore_taxonomy() -- aqui o foco é
+    a composição do catálogo JÁ curado, incluindo o cruzamento (dataset, category)
+    que a seção E não quebra.
+    """
+    print("=== Composição do catálogo pós-curadoria ===")
+    total = len(df)
+    print(f"Total: {total} itens\n")
+
+    print("Por dataset:")
+    by_dataset = df.groupby("dataset").size().sort_values(ascending=False)
+    for dataset, n in by_dataset.items():
+        print(f"  {dataset:20s} {n:>6} ({n/total:.1%})")
+
+    print("\nPor modalidade:")
+    by_modality = df.groupby("tipo_modalidade").size().sort_values(ascending=False)
+    for modality, n in by_modality.items():
+        print(f"  {modality:20s} {n:>6} ({n/total:.1%})")
+
+    print("\nPor (dataset, category):")
+    by_pair = df.groupby(["dataset", "category"]).size().sort_values(ascending=False)
+    for (dataset, category), n in by_pair.items():
+        print(f"  {dataset:16s} / {category:24s} {n:>6}")
+
+    # Sinalizar concentração excessiva explicitamente, não deixar para o leitor notar
+    top_share = by_dataset.iloc[0] / total if total else 0.0
+    if top_share > 0.5:
+        print(f"\n[ATENÇÃO] '{by_dataset.index[0]}' concentra {top_share:.1%} do "
+              f"catálogo. Cobertura, diversidade, baselines e a calibração do "
+              f"guardrail refletirão majoritariamente esse dataset, não o conjunto.")
+
+
+def report_simulator_vocabulary(df: pd.DataFrame) -> None:
+    """
+    Verifica se os valores referenciados pelos bônus dos simuladores de feedback
+    existem de fato no catálogo carregado. Um bônus que nunca dispara significa que
+    o simulador se comporta diferente do que o código sugere -- não é bug de
+    execução (nada quebra), é divergência silenciosa entre intenção e efeito.
+
+    Adaptado à API real: _MODALIDADE_TO_TIPO (data_source.py) mapeia o catálogo
+    real para Tipo em PORTUGUÊS ("Vídeo"/"Áudio"/"Imagem"), não para
+    "video"/"audio"/"image" como uma leitura literal de tipo_modalidade sugeriria.
+    simulate_feedback_holdout já bifurca pela presença da coluna 'category' e usa
+    bônus por category (não por Tipo/Indoor) contra o catálogo real -- ver a
+    docstring da função em sistema_de_recomendacao_v3.py. Esta checagem confirma
+    empiricamente o que aquele comentário já descreve, em vez de reafirmá-lo às
+    cegas.
+    """
+    print("=== Vocabulário de Tipo/category: simuladores vs. catálogo real ===")
+    real_types = set(df["Tipo"].unique())
+    print(f"Tipos presentes no catálogo: {sorted(real_types)}")
+
+    print("\n  simulate_feedback (perfil principal, bônus por Tipo):")
+    expected = {"Corporal", "Áudio", "Vídeo", "Jogo"}
+    matched = expected & real_types
+    missing = expected - real_types
+    print(f"    referenciados pelos bônus: {sorted(expected)}")
+    print(f"    presentes no catálogo:     {sorted(matched) or '(nenhum)'}")
+    if missing:
+        print(f"    [ATENÇÃO] ausentes (bônus nunca dispara para estes valores): "
+              f"{sorted(missing)}")
+
+    print("\n  simulate_feedback_holdout (perfil de avaliação/baselines):")
+    has_category = "category" in df.columns and df["category"].notna().any()
+    if has_category:
+        real_categories = set(df["category"].dropna().unique())
+        expected_cat = {"positive", "neutral"}
+        matched_cat = expected_cat & real_categories
+        missing_cat = expected_cat - real_categories
+        print("    coluna 'category' presente -> usa bônus por category, não por Tipo/Indoor")
+        print(f"    categorias no catálogo:    {sorted(real_categories)}")
+        print(f"    referenciadas pelos bônus: {sorted(expected_cat)}")
+        print(f"    presentes:                 {sorted(matched_cat) or '(nenhum)'}")
+        if missing_cat:
+            print(f"    [ATENÇÃO] ausentes (bônus nunca dispara para estes valores): "
+                  f"{sorted(missing_cat)}")
+    else:
+        expected_holdout = {"Mindfulness", "Imagem"}
+        matched_holdout = expected_holdout & real_types
+        missing_holdout = expected_holdout - real_types
+        print("    coluna 'category' ausente -> usa bônus por Tipo/Indoor (perfil sintético)")
+        print(f"    referenciados pelos bônus: {sorted(expected_holdout)}")
+        print(f"    presentes:                 {sorted(matched_holdout) or '(nenhum)'}")
+        if missing_holdout:
+            print(f"    [ATENÇÃO] ausentes (bônus nunca dispara para estes valores): "
+                  f"{sorted(missing_holdout)}")
+
+    if "Indoor" in df.columns:
+        indoor_values = set(df["Indoor"].unique())
+        print(f"\n  Valores distintos de Indoor: {sorted(indoor_values)}")
+        if len(indoor_values) == 1:
+            print(f"    [ATENÇÃO] Indoor é constante ({indoor_values.pop()}) -- o bônus "
+                  f"de Indoor do holdout (ramo sintético) aplica-se uniformemente a "
+                  f"todos os itens, ou a nenhum. Não discrimina. Irrelevante para o "
+                  f"catálogo real, que usa o ramo por category quando presente.")
+
+
 def report_va_distribution(df: pd.DataFrame) -> None:
     """A. Distribuição de Valência/Arousal — geral e por modalidade."""
     print("=== A. Distribuição Valência/Arousal ===")
@@ -216,7 +320,11 @@ def calibrate_guardrail_thresholds(df: pd.DataFrame, allowed_dest_octants,
     revisão manual -- nunca escolher um valor silenciosamente inseguro.
     """
     min_pool_floor = sysrec.TOP_K if min_pool_floor is None else min_pool_floor
-    arousal_percentiles = [50, 60, 70, 75, 80, 85, 90]
+    # Faixa original ([50, 60, 70, 75, 80, 85, 90]) supunha catálogo pequeno (~100
+    # itens), onde ser mais restritivo que a mediana arriscava esvaziar o pool.
+    # Ampliada para catálogo maior, onde limiares bem mais protetores ainda
+    # provavelmente mantêm pool confortável.
+    arousal_percentiles = [10, 20, 30, 40, 50, 60, 70, 75, 80, 85, 90]
     candidates = [float(np.percentile(df["Arousal"], p)) for p in arousal_percentiles]
 
     print("=== Calibração do limiar de arousal (guardrail, R1) ===")
@@ -273,14 +381,16 @@ def calibrate_valence_threshold(df: pd.DataFrame, allowed_dest_octants,
     """
     Varredura análoga a calibrate_guardrail_thresholds, para o limiar de valência
     aversiva (regra R4: bloqueia item com Valencia < limiar quando o destino tem
-    valência positiva). Percentis BAIXOS da distribuição real de valência (5, 10,
-    15, 20) -- ao contrário do arousal, aqui um limiar MAIOR (menos negativo) é mais
-    protetor (bloqueia mais itens aversivos), então o critério de seleção é
-    invertido: entre os candidatos válidos, o ÚLTIMO da varredura ascendente é o
-    mais protetor (não o primeiro, como em calibrate_guardrail_thresholds).
+    valência positiva). Percentis BAIXOS da distribuição real de valência -- ao
+    contrário do arousal, aqui um limiar MAIOR (menos negativo) é mais protetor
+    (bloqueia mais itens aversivos), então o critério de seleção é invertido: entre
+    os candidatos válidos, o ÚLTIMO da varredura ascendente é o mais protetor (não
+    o primeiro, como em calibrate_guardrail_thresholds).
     """
     min_pool_floor = sysrec.TOP_K if min_pool_floor is None else min_pool_floor
-    valence_percentiles = [5, 10, 15, 20]
+    # Faixa original ([5, 10, 15, 20]) supunha catálogo pequeno; ampliada para
+    # catálogo maior (mesma lógica da faixa de arousal acima).
+    valence_percentiles = [1, 2, 5, 10, 15, 20, 30]
     candidates = [float(np.percentile(df["Valencia"], p)) for p in valence_percentiles]
 
     print("\n=== Calibração do limiar de valência aversiva (guardrail, R4) ===")
@@ -334,6 +444,70 @@ def calibrate_valence_threshold(df: pd.DataFrame, allowed_dest_octants,
     return best
 
 
+def verify_guardrail_effective(df: pd.DataFrame, recommender) -> None:
+    """
+    Confirma que o guardrail de fato bloqueia algo nos estados que deveria
+    proteger. Um guardrail que bloqueia 0 itens não está protegendo -- foi
+    exatamente esse o sintoma observado com os limiares herdados do sintético
+    (0/210 bloqueados para o oitante 5, ver sanity check [4] de sanity_checks).
+    """
+    print("=== Verificação de efetividade do guardrail ===")
+    for curr in list(sysrec.LOW_ENERGY_OCTANTS) + list(sysrec.HIGH_ENERGY_OCTANTS):
+        for dest in sysrec.ALLOWED_DEST_OCTANTS:
+            eligible = df.index.to_numpy(dtype=int)
+            before = len(eligible)
+            after = len(recommender._apply_safety_filter(eligible, curr, dest))
+            blocked = before - after
+            flag = "" if blocked > 0 else "   <-- NADA BLOQUEADO"
+            print(f"  curr={curr} dest={dest}: {blocked:>4}/{before} bloqueados{flag}")
+
+
+def report_feature_degeneracy(df: pd.DataFrame, feature_space) -> None:
+    """
+    Mede quanto cada bloco de features de fato distingue itens. Uma feature
+    constante contribui zero para a similaridade de cosseno usada pelo MMR --
+    se a maioria dos blocos for constante, o MMR não tem o que diversificar, e
+    reponderar MMR_LAMBDA não resolveria nada. Diagnóstico para a diversidade
+    intra-lista observada em coverage_and_diversity (--eval): decide entre
+    reformular features (se os vetores forem majoritariamente idênticos) e
+    reponderar MMR/ampliar CANDIDATE_POOL_SIZE (se os vetores forem distintos mas
+    o pool típico ainda for muito homogêneo) -- ver Tarefa 6 do plano.
+    """
+    print("=== Degenerescência das features ===")
+    matrix = feature_space.item_matrix
+    n_types, n_tags = len(feature_space.all_types), len(feature_space.all_tags)
+
+    blocks = {
+        "one-hot Tipo":    (0, n_types),
+        "Indoor":          (n_types, n_types + 1),
+        "one-hot Tag":     (n_types + 1, n_types + 1 + n_tags),
+        "Duracao norm":    (n_types + 1 + n_tags, n_types + 2 + n_tags),
+        "Valencia norm":   (n_types + 2 + n_tags, n_types + 3 + n_tags),
+        "Arousal norm":    (n_types + 3 + n_tags, n_types + 4 + n_tags),
+    }
+    for name, (lo, hi) in blocks.items():
+        block = matrix[:, lo:hi]
+        n_distinct = len(np.unique(block, axis=0))
+        variance = float(block.var(axis=0).mean())
+        flag = "  <-- CONSTANTE" if n_distinct <= 1 else ""
+        print(f"  {name:16s} dim={hi-lo:>3}  valores distintos={n_distinct:>5}  "
+              f"variância média={variance:.5f}{flag}")
+
+    print(f"\n  Vetores de item completamente idênticos: "
+          f"{len(matrix) - len(np.unique(matrix, axis=0))} de {len(matrix)}")
+
+    # Similaridade média entre pares dentro de um pool típico
+    sample_idx = np.random.choice(len(matrix), size=min(sysrec.CANDIDATE_POOL_SIZE, len(matrix)),
+                                   replace=False)
+    sims = [
+        sysrec._cosine_similarity(matrix[i], matrix[j])
+        for i in sample_idx for j in sample_idx if i < j
+    ]
+    print(f"  Similaridade cosseno média num pool aleatório de "
+          f"{len(sample_idx)} itens: {np.mean(sims):.4f}")
+    print("  (próximo de 1.0 = itens quase indistinguíveis; MMR não tem o que fazer)")
+
+
 def run_full_characterization() -> pd.DataFrame:
     df = sysrec.load_active_catalog()
     if len(df) == 0:
@@ -343,6 +517,7 @@ def run_full_characterization() -> pd.DataFrame:
             "(ou a conexão Mongo) têm itens com Valência/Arousal resolvíveis."
         )
 
+    report_catalog_composition(df)
     report_va_distribution(df)
     report_octant_density(df)
     report_duration(df)
@@ -358,5 +533,19 @@ def run_full_characterization() -> pd.DataFrame:
 if __name__ == "__main__":
     catalog = run_full_characterization()
     print()
+    report_simulator_vocabulary(catalog)
+    print()
     calibrate_guardrail_thresholds(catalog, sysrec.ALLOWED_DEST_OCTANTS)
     calibrate_valence_threshold(catalog, sysrec.ALLOWED_DEST_OCTANTS)
+    print()
+
+    # Verificação de efetividade contra os limiares ATUAIS de
+    # sysrec.SAFETY_AROUSAL_THRESHOLD/SAFETY_AVERSIVE_VALENCE_THRESHOLD (não os
+    # candidatos calibrados acima -- aplicar os valores escolhidos no código e
+    # rodar de novo para confirmar).
+    _feature_space = sysrec.FeatureSpace(catalog)
+    _agent = sysrec.Agent(catalog, _feature_space)
+    _recommender = sysrec.Recommender(catalog, _feature_space, _agent)
+    verify_guardrail_effective(catalog, _recommender)
+    print()
+    report_feature_degeneracy(catalog, _feature_space)

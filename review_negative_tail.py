@@ -53,7 +53,7 @@ def _append_blocked_id(item_id: str, path: str = BLOCKED_IDS_OUTPUT_PATH) -> Non
 
 
 def review_negative_tail(dataset_name: str, n_items: int = 100,
-                          resume: bool = True) -> int:
+                          resume: bool = True) -> tuple[int, bool]:
     """
     Itera os itens de menor valência de um dataset (via iter_raw_docs, dados
     brutos -- não precisa de aprovação prévia para ser revisado, é justamente a
@@ -64,61 +64,78 @@ def review_negative_tail(dataset_name: str, n_items: int = 100,
     Não fixa um número pequeno arbitrário de itens a revisar: n_items=100 por
     padrão, e o critério de parada por dataset (ver seção 4.2 do plano de
     consolidação) é rodar em lotes de 100 e parar quando um lote inteiro não gerar
-    nenhum bloqueio -- não um número decidido de antemão. Esta função devolve a
-    contagem de bloqueios do lote, para o chamador (ou um loop externo) decidir se
-    vale rodar outro lote.
+    nenhum bloqueio -- não um número decidido de antemão. Esta função devolve
+    (contagem de bloqueios do lote, se o lote foi de fato completado -- False
+    quando a sessão foi interrompida via [q]uit antes de esgotar o lote), para o
+    chamador (ou um loop externo) decidir se vale rodar outro lote e se o sinal de
+    "lote limpo" é confiável.
     """
     watermark = _load_watermark()
     already_reviewed = set(watermark.get(dataset_name, []))
 
-    docs = list(data_source.iter_raw_docs(dataset_filter=dataset_name))
-    docs_with_va = [
-        (d, _get(d, "ratings.valenceNormalized") or _get(d, "staticAnnotations.valenceNormalized"))
-        for d in docs
-    ]
+    # OASIS e EmoMadrid (os dois datasets a que este script se destina, ver
+    # docstring do módulo) são datasets só de imagem -- restringir a modalidade
+    # evita carregar videos.json/audios.json à toa em cada execução.
+    docs = list(data_source.iter_raw_docs(modality="image", dataset_filter=dataset_name))
+
+    def _valence(d):
+        v = _get(d, "ratings.valenceNormalized")
+        return v if v is not None else _get(d, "staticAnnotations.valenceNormalized")
+
+    docs_with_va = [(d, _valence(d)) for d in docs]
     docs_with_va = [(d, v) for d, v in docs_with_va if v is not None]
     docs_with_va.sort(key=lambda x: x[1])  # mais negativo primeiro
 
     print(f"=== Revisão manual: {dataset_name} ({len(docs_with_va)} itens com V/A) ===")
     reviewed_count = 0
     blocked_count = 0
-    for doc, valence in docs_with_va:
-        item_id = str(doc["_id"])
-        if resume and item_id in already_reviewed:
-            continue
-        if reviewed_count >= n_items:
-            print(f"\nLimite de {n_items} itens revisados nesta sessão. "
-                  f"Rode novamente para continuar de onde parou.")
-            break
+    quit_early = False
+    try:
+        for doc, valence in docs_with_va:
+            item_id = str(doc["_id"])
+            if resume and item_id in already_reviewed:
+                continue
+            if reviewed_count >= n_items:
+                print(f"\nLimite de {n_items} itens revisados nesta sessão. "
+                      f"Rode novamente para continuar de onde parou.")
+                break
 
-        arousal = _get(doc, "ratings.arousalNormalized") or _get(doc, "staticAnnotations.arousalNormalized")
-        print(f"\n[{item_id}] {dataset_name} | category={doc.get('category')}")
-        print(f"  V={valence:+.3f}  A={arousal if arousal is not None else 'N/A'}")
-        print(f"  título: {doc.get('title', '(sem título)')}")
-        url = doc.get("imageUrl") or doc.get("audioUrl") or doc.get("videoUrl")
-        if url:
-            print(f"  url: {url}")
+            arousal = _get(doc, "ratings.arousalNormalized")
+            if arousal is None:
+                arousal = _get(doc, "staticAnnotations.arousalNormalized")
+            print(f"\n[{item_id}] {dataset_name} | category={doc.get('category')}")
+            print(f"  V={valence:+.3f}  A={arousal if arousal is not None else 'N/A'}")
+            print(f"  título: {doc.get('title', '(sem título)')}")
+            url = doc.get("imageUrl") or doc.get("audioUrl") or doc.get("videoUrl")
+            if url:
+                print(f"  url: {url}")
 
-        decision = input("  [a]provar / [b]loquear / [s]kip / [q]uit: ").strip().lower()
-        if decision == "q":
-            break
-        if decision == "b":
-            _append_blocked_id(item_id)
-            blocked_count += 1
-            print("  -> bloqueado.")
-        elif decision == "a":
-            print("  -> aprovado (nenhuma ação; item elegível pelas demais camadas).")
-        # "s" (skip) não marca como revisado -- reaparece na próxima sessão
+            decision = input("  [a]provar / [b]loquear / [s]kip / [q]uit: ").strip().lower()
+            if decision == "q":
+                quit_early = True
+                break
+            if decision == "b":
+                _append_blocked_id(item_id)
+                blocked_count += 1
+                print("  -> bloqueado.")
+            elif decision == "a":
+                print("  -> aprovado (nenhuma ação; item elegível pelas demais camadas).")
+            # "s" (skip) não marca como revisado -- reaparece na próxima sessão
 
-        if decision in ("a", "b"):
-            already_reviewed.add(item_id)
-            reviewed_count += 1
+            if decision in ("a", "b"):
+                already_reviewed.add(item_id)
+                reviewed_count += 1
+    finally:
+        # salva o watermark mesmo em interrupção (Ctrl+C, EOFError etc.) -- do
+        # contrário decisões já gravadas em BLOCKED_IDS_OUTPUT_PATH ficam
+        # dessincronizadas do progresso e itens já revisados voltam a aparecer.
+        watermark[dataset_name] = sorted(already_reviewed)
+        _save_watermark(watermark)
 
-    watermark[dataset_name] = sorted(already_reviewed)
-    _save_watermark(watermark)
     print(f"\nProgresso salvo: {len(already_reviewed)} itens revisados no total "
           f"para {dataset_name} ({blocked_count} bloqueado(s) neste lote).")
-    return blocked_count
+    full_batch_completed = not quit_early
+    return blocked_count, full_batch_completed
 
 
 def _main() -> None:
@@ -133,11 +150,15 @@ def _main() -> None:
                          help="Ignora o watermark e revisa desde o item mais negativo.")
     args = parser.parse_args()
 
-    blocked = review_negative_tail(args.dataset, n_items=args.n_items, resume=not args.no_resume)
-    if blocked == 0:
+    blocked, full_batch_completed = review_negative_tail(
+        args.dataset, n_items=args.n_items, resume=not args.no_resume)
+    if blocked == 0 and full_batch_completed:
         print(f"\nLote sem nenhum bloqueio -- candidato a ponto de corte para "
               f"{args.dataset} (ver seção 4.2 do plano de consolidação: parar quando "
               f"um lote inteiro não gerar bloqueio).")
+    elif blocked == 0:
+        print(f"\nSessão interrompida antes de completar o lote -- nenhum sinal de "
+              f"ponto de corte ainda; rode novamente para revisar os itens restantes.")
 
 
 if __name__ == "__main__":

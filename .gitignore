@@ -1,3 +1,7 @@
 # Exports locais do Mongo (mongoexport --jsonArray) usados pelo backend
 # DATA_BACKEND="json_export" -- dados reais de terceiros, não versionar.
 dbs/*.json
+
+# Ambiente virtual Python
+.venv/
+__pycache__/

@@ -99,3 +99,62 @@ def explore_taxonomy():
         print(f"{dataset:16s} {category:24s} n={counts[key]:5d}  "
               f"subcats={sorted(subcats_by_key[key])}")
     return counts, subcats_by_key
+
+
+# Datasets sem evidência de que as Camadas 2-4 (keyword/geométrica/item_id) falhem --
+# diferente de OASIS e EmoMadrid, onde a revisão manual da cauda negativa
+# (review_negative_tail.py) encontrou casos que a denylist e o filtro geométrico
+# deixaram passar. GAPED fica de fora por ter regra estrutural própria (só
+# categorias neutra/positiva da taxonomia documentada, ver APPROVED_CATEGORIES).
+AUTO_APPROVE_SAFE_DATASETS = ("DEAM", "MEDITATION_LOCAL", "EMOPIA", "MuVi")
+
+
+def auto_approve_clean_categories(safe_datasets=AUTO_APPROVE_SAFE_DATASETS,
+                                   dry_run: bool = True) -> set:
+    """
+    Aprova em lote os pares (dataset, category) cujos nomes de categoria e
+    subcategorias não contêm nenhum termo da denylist, restrito aos datasets
+    passados. NÃO desativa nenhuma camada: as Camadas 2 (keyword por item),
+    3 (valência extrema) e 4 (bloqueio por item_id) continuam atuando item a item
+    dentro das categorias aprovadas -- aprovar uma categoria não libera itens
+    individuais problemáticos dentro dela.
+
+    dry_run=True (padrão): só imprime o que seria aprovado, não retorna decisão
+    aplicada. Rodar primeiro em dry-run, revisar a saída, só então dry_run=False.
+    """
+    counts, subcats_by_key = explore_taxonomy()
+    approved, skipped = set(), []
+
+    for (dataset, category), n in sorted(counts.items()):
+        if dataset not in safe_datasets:
+            continue
+        haystack = " ".join([
+            category or "",
+            " ".join(subcats_by_key.get((dataset, category), [])),
+        ]).lower()
+        hits = [t for t in sysrec.SAFETY_DENYLIST_KEYWORDS if t in haystack]
+        if hits:
+            skipped.append((dataset, category, n, hits))
+            continue
+        approved.add((dataset, category))
+
+    print(f"\n=== auto_approve_clean_categories (dry_run={dry_run}) ===")
+    print(f"Datasets considerados: {list(safe_datasets)}\n")
+    print("Aprovados:")
+    for dataset, category in sorted(approved):
+        print(f"  ({dataset!r}, {category!r})  n={counts[(dataset, category)]}")
+    if skipped:
+        print("\nPulados (keyword na categoria/subcategoria):")
+        for dataset, category, n, hits in skipped:
+            print(f"  ({dataset!r}, {category!r})  n={n}  hits={hits}")
+
+    print("\nDatasets NÃO cobertos por esta função, e por quê:")
+    print("  OASIS, EmoMadrid -> revisão manual da cauda negativa pendente "
+          "(Camadas 2/3 comprovadamente insuficientes nesses dois)")
+    print("  GAPED            -> regra estrutural própria (só categorias neutra/positiva)")
+
+    if dry_run:
+        print("\n[dry-run] Nada foi aplicado. Revise a lista acima e rode com "
+              "dry_run=False para obter o conjunto a colar em APPROVED_CATEGORIES.")
+        return set()
+    return approved
