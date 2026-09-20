@@ -51,7 +51,7 @@ def get_read_only_client(modality: str):
     update/insert/delete em nenhum lugar do código que usa este cliente.
 
     Import de pymongo é LOCAL de propósito: mantém `import data_source` funcionando
-    sem pymongo instalado para quem só usa o backend 'csv' ou 'json_export' -- só
+    sem pymongo instalado para quem só usa o backend 'csv' ou 'json_export' - só
     quando esta função é de fato chamada (backend 'mongo') é que a dependência entra
     em jogo."""
     from pymongo import MongoClient
@@ -78,7 +78,7 @@ def _unwrap_extended_json(obj):
 
 
 def _resolve_json_path(filename: str) -> str:
-    """Resolve o caminho de um export dentro do diretório de referência ÚNICO onde as
+    """Resolve o caminho de um export dentro do diretório de referência único onde as
     databases exportadas via mongoexport ficam armazenadas: sysrec.JSON_EXPORT_DIR
     (pasta dbs/ na raiz do projeto). Instrução explícita do usuário: este ponto NÃO
     segue a busca em múltiplos candidatos (diretório do módulo / cwd / etc.) usada em

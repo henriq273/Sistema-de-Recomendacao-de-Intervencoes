@@ -26,6 +26,7 @@ Uso:
     python characterize.py
 """
 from collections import Counter
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
@@ -281,6 +282,144 @@ def report_pool_size_with_guardrail(df: pd.DataFrame, allowed_dest_octants) -> d
     return {"raw_results": results}
 
 
+def _apply_safety_filter_standalone(df: pd.DataFrame, eligible: np.ndarray,
+                                     curr_oct: int, dest_oct: int) -> np.ndarray:
+    """Réplica pura de Recommender._apply_safety_filter, sem precisar de uma
+    instância de Recommender/Agent -- usado só por ferramentas de diagnóstico.
+    Respeita sysrec.USE_SAFETY_FILTER, como o método real, para que
+    safety_filter_disabled() (Parte C) tenha efeito sobre ela."""
+    if not sysrec.USE_SAFETY_FILTER:
+        return eligible
+
+    A = df.loc[eligible, "Arousal"].to_numpy(dtype=np.float32)
+    V = df.loc[eligible, "Valencia"].to_numpy(dtype=np.float32)
+    tv, ta = sysrec.OCTANT_MAP[dest_oct]
+
+    r1 = (curr_oct in sysrec.LOW_ENERGY_OCTANTS) & (A > sysrec.SAFETY_AROUSAL_THRESHOLD)
+    r2 = (curr_oct in sysrec.HIGH_ENERGY_OCTANTS) & (A > sysrec.SAFETY_AROUSAL_THRESHOLD)
+    r3 = (ta < 0) & (A > sysrec.SAFETY_AROUSAL_THRESHOLD)
+    r4 = (tv > 0) & (V < sysrec.SAFETY_AVERSIVE_VALENCE_THRESHOLD)
+    blocked = r1 | r2 | r3 | r4
+    safe = eligible[~blocked]
+    return safe if len(safe) > 0 else eligible
+
+
+def report_guardrail_breakdown(df: pd.DataFrame) -> None:
+    """
+    Decompõe o efeito do guardrail regra por regra, e separadamente por par
+    (curr, dest) via _apply_safety_filter_standalone, para localizar exatamente
+    qual regra é responsável por um pool pequeno observado em algum contexto.
+    Roda sobre o CATÁLOGO INTEIRO (não um contexto só), para responder de onde
+    vem o número que está sendo observado como "sobraram poucos itens".
+    """
+    total = len(df)
+    print(f"=== Decomposição do guardrail (catálogo com {total} itens) ===\n")
+
+    valencia = df["Valencia"].to_numpy(dtype=np.float32)
+    arousal = df["Arousal"].to_numpy(dtype=np.float32)
+
+    def _count(mask):
+        return int(mask.sum())
+
+    print("Regras avaliadas isoladamente sobre o catálogo inteiro:")
+    r1 = arousal > sysrec.SAFETY_AROUSAL_THRESHOLD  # aplicável só se curr in LOW_ENERGY
+    print(f"  R1 (arousal > {sysrec.SAFETY_AROUSAL_THRESHOLD:.3f}): "
+          f"{_count(r1)}/{total} itens ({_count(r1)/total:.1%}) -- "
+          f"só afeta curr in {sysrec.LOW_ENERGY_OCTANTS}")
+    print(f"  R2 (mesmo limiar de arousal): idêntico a R1 -- "
+          f"só afeta curr in {sysrec.HIGH_ENERGY_OCTANTS}")
+
+    for dest in sysrec.ALLOWED_DEST_OCTANTS:
+        tv, ta = sysrec.OCTANT_MAP[dest]
+        r3 = (ta < 0) & r1  # nenhum ALLOWED_DEST_OCTANTS tem ta<0 hoje -- deve dar 0
+        r4 = (tv > 0) & (valencia < sysrec.SAFETY_AVERSIVE_VALENCE_THRESHOLD)
+        print(f"  dest={dest} (V={tv:+.2f},A={ta:+.2f}): "
+              f"R3={_count(r3)} (esperado 0 se ta>=0)  "
+              f"R4={_count(r4)}/{total} ({_count(r4)/total:.1%})")
+
+    print(f"\n  [CHAVE] R4 é a única regra sem restrição de curr_oct -- ela se "
+          f"aplica em TODA chamada de recommend() com destino em "
+          f"{sysrec.ALLOWED_DEST_OCTANTS}, diferente de R1/R2 que só afetam estados "
+          f"específicos. Se R4 sozinha já exclui uma fração grande do catálogo, "
+          f"ela é a candidata principal para recalibração.")
+
+    print("\nPor par (curr, dest) -- via _apply_safety_filter_standalone:")
+    eligible_all = df.index.to_numpy(dtype=int)
+    worst = None
+    for curr in range(1, 9):
+        for dest in sysrec.ALLOWED_DEST_OCTANTS:
+            safe = _apply_safety_filter_standalone(df, eligible_all, curr, dest)
+            n_safe = len(safe)
+            if worst is None or n_safe < worst[0]:
+                worst = (n_safe, curr, dest)
+            print(f"  curr={curr} dest={dest}: {n_safe}/{total} sobrevivem")
+    print(f"\n  Pior caso: curr={worst[1]} dest={worst[2]} -> {worst[0]} itens")
+
+
+def report_calibration_staleness(df: pd.DataFrame) -> None:
+    """Compara a distribuição ATUAL de valência/arousal com o que os limiares
+    configurados implicam -- se o catálogo mudou de composição depois da
+    calibração (ex.: safety.auto_approve_clean_categories rodou depois), os
+    limiares podem não corresponder mais aos percentis que motivaram sua escolha."""
+    v_percentile = float((df["Valencia"] < sysrec.SAFETY_AVERSIVE_VALENCE_THRESHOLD).mean() * 100)
+    a_percentile = float((df["Arousal"] > sysrec.SAFETY_AROUSAL_THRESHOLD).mean() * 100)
+    print("=== Atualidade da calibração ===")
+    print(f"  SAFETY_AVERSIVE_VALENCE_THRESHOLD={sysrec.SAFETY_AVERSIVE_VALENCE_THRESHOLD:.3f} "
+          f"hoje corresponde ao percentil {v_percentile:.1f} da valência real "
+          f"(bloqueia {v_percentile:.1f}% do catálogo via R4 sozinha)")
+    print(f"  SAFETY_AROUSAL_THRESHOLD={sysrec.SAFETY_AROUSAL_THRESHOLD:.3f} hoje "
+          f"corresponde ao percentil {100-a_percentile:.1f} do arousal real")
+    print("  Se estes percentis divergem muito do que foi PRETENDIDO na "
+          "calibração original, o catálogo mudou de composição desde então -- "
+          "recalibrar (Parte B), não ajustar os números na mão.")
+
+
+@contextmanager
+def safety_filter_disabled():
+    """
+    Desliga sysrec.USE_SAFETY_FILTER dentro do bloco `with`, restaurando o valor
+    original ao sair -- inclusive em caso de exceção. Uso exclusivo de bancada de
+    diagnóstico (characterize.py, comparações com/sem guardrail). NUNCA envolver
+    o loop interativo de produção (main()) com isto -- ver teste de aceitação 6
+    do plano (busca textual: nunca usado em torno de main()/loop interativo).
+    """
+    original = sysrec.USE_SAFETY_FILTER
+    sysrec.USE_SAFETY_FILTER = False
+    try:
+        yield
+    finally:
+        sysrec.USE_SAFETY_FILTER = original
+
+
+def compare_pool_with_without_guardrail(df: pd.DataFrame, allowed_dest_octants) -> None:
+    """
+    Compara, célula a célula da grade curr x allowed_dest_octants, o tamanho do
+    pool elegível COM e SEM o guardrail geométrico -- quantifica exatamente
+    quanto ele está custando em tamanho de pool.
+
+    Adaptado do pseudocódigo original do plano: report_pool_size_baseline/
+    report_pool_size_with_guardrail (seções C/C') reimplementam R1-R4 sem checar
+    sysrec.USE_SAFETY_FILTER, então envolvê-las em safety_filter_disabled() não
+    teria efeito algum. Em vez disso, esta função chama
+    _apply_safety_filter_standalone diretamente -- que respeita a flag -- para
+    que o context manager realmente tenha efeito na comparação.
+    """
+    print("=== Pool COM guardrail vs. SEM guardrail (diagnóstico) ===")
+    eligible_all = df.index.to_numpy(dtype=int)
+    worst_cost = None
+    for curr in range(1, 9):
+        for dest in allowed_dest_octants:
+            with_guard = len(_apply_safety_filter_standalone(df, eligible_all, curr, dest))
+            with safety_filter_disabled():
+                without_guard = len(_apply_safety_filter_standalone(df, eligible_all, curr, dest))
+            cost = without_guard - with_guard
+            if worst_cost is None or cost > worst_cost[0]:
+                worst_cost = (cost, curr, dest, with_guard, without_guard)
+            print(f"  curr={curr} dest={dest}: com={with_guard:>5}  sem={without_guard:>5}  custo={cost:>5}")
+    print(f"\n  Maior custo: curr={worst_cost[1]} dest={worst_cost[2]} -> guardrail remove "
+          f"{worst_cost[0]} itens ({worst_cost[3]} restantes de {worst_cost[4]})")
+
+
 def report_normalization_audit() -> None:
     """G. Reaudição em escala plena (reusa normalization.py já especificado)."""
     print("\n=== G. Reaudição de normalização (amostra completa por dataset) ===")
@@ -388,9 +527,11 @@ def calibrate_valence_threshold(df: pd.DataFrame, allowed_dest_octants,
     o primeiro, como em calibrate_guardrail_thresholds).
     """
     min_pool_floor = sysrec.TOP_K if min_pool_floor is None else min_pool_floor
-    # Faixa original ([5, 10, 15, 20]) supunha catálogo pequeno; ampliada para
-    # catálogo maior (mesma lógica da faixa de arousal acima).
-    valence_percentiles = [1, 2, 5, 10, 15, 20, 30]
+    # Passo mais fino perto da cauda do que a faixa anterior ([1, 2, 5, 10, 15,
+    # 20, 30]): R4 (valência) não é filtrada por curr_oct como R1/R2/R3 são --
+    # cada ponto percentual aqui custa uma fração do catálogo INTEIRO, não de um
+    # subconjunto por estado, então vale mais resolução perto da cauda.
+    valence_percentiles = [1, 2, 3, 5, 8, 10, 15, 20]
     candidates = [float(np.percentile(df["Valencia"], p)) for p in valence_percentiles]
 
     print("\n=== Calibração do limiar de valência aversiva (guardrail, R4) ===")
@@ -535,6 +676,12 @@ if __name__ == "__main__":
     print()
     report_simulator_vocabulary(catalog)
     print()
+    report_guardrail_breakdown(catalog)
+    print()
+    report_calibration_staleness(catalog)
+    print()
+    compare_pool_with_without_guardrail(catalog, sysrec.ALLOWED_DEST_OCTANTS)
+    print()
     calibrate_guardrail_thresholds(catalog, sysrec.ALLOWED_DEST_OCTANTS)
     calibrate_valence_threshold(catalog, sysrec.ALLOWED_DEST_OCTANTS)
     print()
@@ -549,3 +696,9 @@ if __name__ == "__main__":
     verify_guardrail_effective(catalog, _recommender)
     print()
     report_feature_degeneracy(catalog, _feature_space)
+    print()
+
+    # Confirmação final (ordem de execução, passo 4 do plano de diagnóstico do
+    # guardrail): reconfere a decomposição contra os limiares ATUAIS já aplicados
+    # no código, não os candidatos calibrados acima.
+    report_guardrail_breakdown(catalog)
