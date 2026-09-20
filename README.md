@@ -253,6 +253,30 @@ guardrail de fato bloqueia itens (>0) em todo par `(curr, dest)` de
 `LOW_ENERGY_OCTANTS`/`HIGH_ENERGY_OCTANTS` × `ALLOWED_DEST_OCTANTS` — um guardrail
 que bloqueia 0 itens não está protegendo.
 
+`report_guardrail_breakdown` decompõe o efeito das 4 regras (R1–R4) sobre o
+catálogo inteiro e por par `(curr, dest)`, via `_apply_safety_filter_standalone`
+(réplica pura de `Recommender._apply_safety_filter`, sem precisar instanciar
+`Recommender`/`Agent`). Achado relevante: **R3 e R4 não são filtradas por
+`curr_oct`** — R3 (`ta < 0`) depende só do destino, e para os destinos com
+arousal-alvo negativo (`7`, `8`) bloqueia o mesmo conjunto de itens para
+**qualquer** `curr_oct`, não só `LOW_ENERGY_OCTANTS`/`HIGH_ENERGY_OCTANTS`; R4
+nunca teve restrição de `curr_oct`. As duas juntas são as regras com maior
+impacto agregado no catálogo, porque se aplicam em toda chamada de `recommend()`
+para aquele destino, não só em estados específicos. `report_calibration_staleness`
+reporta os percentis que os limiares atuais implicam contra a distribuição real —
+útil para notar quando a calibração ficou desatualizada (ex.: depois de
+`safety.auto_approve_clean_categories` mudar a composição do catálogo) sem
+precisar rodar a varredura completa de novo.
+
+`compare_pool_with_without_guardrail` e o context manager `safety_filter_disabled`
+(que desliga `sysrec.USE_SAFETY_FILTER` dentro do bloco `with`, restaurando o
+valor original mesmo em caso de exceção) quantificam, célula a célula, quanto o
+guardrail custa em tamanho de pool — uso exclusivo desta bancada de diagnóstico,
+**nunca** em torno do loop interativo de produção (`main()`). Não é uma flag nova:
+`USE_SAFETY_FILTER` continua sendo a única fonte de verdade para ligar/desligar o
+guardrail geométrico; o context manager só evita que alguém esqueça de religar
+manualmente durante uma exploração.
+
 ### Diagnóstico de espaçamento de recomendações (`fatigue_diagnostics.py`)
 
 Script standalone, fora do caminho de produção — mede o comportamento real de

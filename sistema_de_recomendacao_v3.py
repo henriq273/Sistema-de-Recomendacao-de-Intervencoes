@@ -109,9 +109,24 @@ HIGH_ENERGY_OCTANTS = (3, 4)     # Estressado/Ansioso, Irritado/Raiva
 # os 5 datasets acima.
 #   Arousal:  percentil 10 da distribuição real, pool mínimo garantido 12/12
 #             (CANDIDATE_POOL_SIZE) em toda a grade de diagnóstico.
-#   Valência: percentil 30 da distribuição real, mesmo pool mínimo garantido.
+#
+# Valência recalibrada de novo em 2026-09-16 (diagnóstico "guardrail filtrando em
+# excesso"): report_guardrail_breakdown revelou que R3 (destino ta<0, ver
+# _apply_safety_filter) e R4 são as DUAS regras sem restrição de curr_oct -- para
+# dest em {7, 8} (ambos com arousal-alvo negativo), R3+R4 juntas bloqueiam o mesmo
+# conjunto de itens para TODO curr_oct, não só LOW/HIGH_ENERGY_OCTANTS. Como
+# CANDIDATE_POOL_SIZE=12 é pequeno frente ao catálogo (3627 itens), o piso de pool
+# usado por calibrate_valence_threshold nunca chega a ser o fator limitante --
+# qualquer percentil até a faixa alta ainda deixa >>12 itens, então a escolha do
+# limiar é essencialmente uma decisão de política (quanto do catálogo aceitar
+# bloquear via uma regra aplicada universalmente), não um mínimo determinado pelos
+# dados. Escolhido percentil 20 (grade mais fina na cauda:
+# [1, 2, 3, 5, 8, 10, 15, 20]), bloqueando ~18.6% do catálogo via R4 sozinha, em
+# vez do percentil 30 anterior (~31.2%) -- ver report_calibration_staleness para
+# reconferir o percentil real implicado sempre que o catálogo mudar de novo.
+#   Valência: percentil 20 da distribuição real, pool mínimo garantido 12/12.
 SAFETY_AROUSAL_THRESHOLD = -0.526           # itens acima disso são bloqueados (R1/R2/R3)
-SAFETY_AVERSIVE_VALENCE_THRESHOLD = -0.175  # itens abaixo disso são bloqueados (R4)
+SAFETY_AVERSIVE_VALENCE_THRESHOLD = -0.400  # itens abaixo disso são bloqueados (R4)
 # Destinos plausíveis para a grade de diagnóstico/calibração (characterize.py): só
 # oitantes de valência positiva fazem sentido como alvo de uma intervenção
 # oitantes 3-6 (valência negativa) nunca são um destino terapêutico razoável. Não
