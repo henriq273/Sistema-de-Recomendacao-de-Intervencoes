@@ -24,10 +24,28 @@ Uso:
 """
 import random
 from collections import defaultdict
+from contextlib import contextmanager
 
 import numpy as np
 
 import sistema_de_recomendacao_v3 as sysrec
+
+
+@contextmanager
+def _override(module, **kwargs):
+    """Sobrescreve temporariamente atributos de módulo, restaurando os valores
+    originais ao sair -- inclusive em caso de exceção. Generaliza o mesmo padrão já
+    usado em characterize.safety_filter_disabled (que só cobria USE_SAFETY_FILTER)
+    para qualquer combinação de constantes. Uso exclusivo de bancada de diagnóstico;
+    NUNCA envolver o loop interativo de produção (main()) com isto."""
+    original = {k: getattr(module, k) for k in kwargs}
+    for k, v in kwargs.items():
+        setattr(module, k, v)
+    try:
+        yield
+    finally:
+        for k, v in original.items():
+            setattr(module, k, v)
 
 
 def trace_repeats(recommender: sysrec.Recommender, contexts: list, k: int = None) -> dict:
@@ -112,6 +130,74 @@ def score_gap_analysis(recommender: sysrec.Recommender, contexts: list, n_sample
           f"{(gaps >= sysrec.FATIGUE_LAMBDA).mean():.1%}")
 
 
+# Pares (FATIGUE_MIN_GAP, CANDIDATE_POOL_SIZE) medidos por terceiros (EmoWeb/
+# classification-api, contra dev/teste-jason-db 49c950b). O primeiro par também é a
+# configuração vigente hoje neste módulo (FATIGUE_MIN_GAP=10, CANDIDATE_POOL_SIZE=12).
+_REPORTED_GAP_POOL_PAIRS = (
+    (10, 12), (10, 20), (10, 31), (10, 34), (6, 12), (6, 20), (3, 12),
+)
+
+
+def _measure_violation(df, feature_space, agent, gap: int, pool: int,
+                        curr: int, dest: int, n_calls: int) -> tuple[float, list]:
+    with _override(sysrec, FATIGUE_MIN_GAP=gap, CANDIDATE_POOL_SIZE=pool):
+        fresh = sysrec.Recommender(df, feature_space, agent)
+        result = trace_repeats(fresh, [(curr, dest, 30)] * n_calls)
+        gaps_top1 = np.array(result["gaps_top1"])
+        violation = float((gaps_top1 < gap).mean()) if len(gaps_top1) else 0.0
+        return violation, gaps_top1.tolist()
+
+
+def report_fatigue_pool_interaction(df, feature_space, agent,
+                                     pairs=_REPORTED_GAP_POOL_PAIRS,
+                                     n_calls: int = 40) -> None:
+    """
+    [Diagnóstico 5] blocked_mask degenera em silêncio quando o pool truncado não
+    tem candidatos suficientes para sustentar um ciclo sem repetição dentro da
+    janela: _candidate_pool trunca a CANDIDATE_POOL_SIZE ANTES do bloqueio de
+    fadiga (Recommender.recommend), e o guard "fatigue_blocked.any() and not
+    fatigue_blocked.all()" descarta o bloqueio POR INTEIRO assim que ele bateria
+    em todo o pool truncado -- não parcialmente.
+
+    Reproduz primeiro a tabela reportada por terceiros (EmoWeb/classification-api,
+    contra dev/teste-jason-db 49c950b), que usa "FATIGUE_MIN_GAP * TOP_K" como
+    proxy do gatilho. Nesta base o resultado costuma vir 0% mesmo nos pares
+    reportados como violando -- não porque o bug tenha sido corrigido (o código é
+    idêntico), mas porque aqui só o item EXECUTADO (slot 1) entra em cooldown por
+    rodada, não os TOP_K exibidos (ver docstring do módulo e
+    FatigueTracker.mark_executed) -- um refactor que pode já não existir na branch
+    deles. Por isso o gatilho real aqui é outro: o ciclo natural de candidatos
+    distintos no pool tolera qualquer FATIGUE_MIN_GAP <= CANDIDATE_POOL_SIZE sem
+    nenhum bloqueio precisar disparar; passar de CANDIDATE_POOL_SIZE já é
+    suficiente para colapsar. A segunda varredura abaixo mede exatamente essa
+    fronteira, com CANDIDATE_POOL_SIZE fixo no valor vigente e FATIGUE_MIN_GAP
+    variando ao redor dele.
+    """
+    print(f"\n=== Diagnóstico 5a: tabela reportada (FATIGUE_MIN_GAP x "
+          f"CANDIDATE_POOL_SIZE, contexto fixo curr=5 dest=8, {n_calls} chamadas) ===")
+    print(f"{'gap':>5} {'pool':>6} {'gap*TOP_K':>10} {'violação da janela':>20}")
+    for gap, pool in pairs:
+        violation, _ = _measure_violation(df, feature_space, agent, gap, pool, 5, 8, n_calls)
+        marker = ("  <-- config atual (FATIGUE_MIN_GAP/CANDIDATE_POOL_SIZE)"
+                   if (gap, pool) == (sysrec.FATIGUE_MIN_GAP, sysrec.CANDIDATE_POOL_SIZE)
+                   else "")
+        print(f"{gap:>5} {pool:>6} {gap * sysrec.TOP_K:>10} {violation:>19.1%}{marker}")
+
+    pool = sysrec.CANDIDATE_POOL_SIZE
+    print(f"\n=== Diagnóstico 5b: fronteira real (CANDIDATE_POOL_SIZE={pool} fixo, "
+          f"FATIGUE_MIN_GAP variando, contexto fixo curr=5 dest=8, {n_calls} chamadas) ===")
+    print(f"{'gap':>5} {'violação da janela':>20}")
+    for gap in range(max(2, pool - 4), pool + 5):
+        violation, _ = _measure_violation(df, feature_space, agent, gap, pool, 5, 8, n_calls)
+        marker = "  <-- vigente hoje" if gap == sysrec.FATIGUE_MIN_GAP else ""
+        boundary = "  <-- CANDIDATE_POOL_SIZE" if gap == pool else ""
+        print(f"{gap:>5} {violation:>19.1%}{marker}{boundary}")
+    print(f"  Margem hoje: FATIGUE_MIN_GAP={sysrec.FATIGUE_MIN_GAP} está "
+          f"{pool - sysrec.FATIGUE_MIN_GAP} unidade(s) abaixo de CANDIDATE_POOL_SIZE={pool} "
+          f"-- qualquer aumento de FATIGUE_MIN_GAP além disso (ou redução de "
+          f"CANDIDATE_POOL_SIZE abaixo dele) reabre o colapso sem aviso nenhum.")
+
+
 def run_fatigue_diagnostics(recommender: sysrec.Recommender, df) -> None:
     print("=== Diagnóstico 1: curva de decaimento da penalidade suave ===")
     for delta in range(0, 16):
@@ -133,6 +219,8 @@ def run_fatigue_diagnostics(recommender: sysrec.Recommender, df) -> None:
 
     print("\n=== Diagnóstico 4: penalidade de fadiga vs. gap real de score ===")
     score_gap_analysis(recommender, fixed_ctx + random_ctx)
+
+    report_fatigue_pool_interaction(df, recommender.feature_space, recommender.agent)
 
 
 if __name__ == "__main__":

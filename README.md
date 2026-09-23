@@ -226,7 +226,7 @@ modalidade, densidade por oitante geométrico, duração por modalidade/bucket d
 tempo, sobrevivência da curadoria por dataset, confiabilidade da origem
 psychometric/heuristic, tamanho de pool na grade completa de contextos, reaudição
 de normalização, consistência interna agregada, vocabulário de `Tipo`/`category`
-referenciado pelos bônus dos simuladores de feedback contra o catálogo real
+referenciado pelos bônus do simulador de feedback contra o catálogo real
 (`report_simulator_vocabulary` — sinaliza bônus que nunca disparam) e
 degenerescência dos blocos de feature usados pelo MMR (`report_feature_degeneracy`
 — quanto cada bloco distingue itens; informa se baixa diversidade intra-lista vem
@@ -236,18 +236,20 @@ de features degeneradas ou de um pool naturalmente homogêneo):
 python characterize.py
 ```
 
-Também calibra os limiares do guardrail (`calibrate_guardrail_thresholds` para
-arousal, `calibrate_valence_threshold` para valência aversiva) a partir de
-percentis da distribuição **real** do catálogo já curado — nunca herdados do
-dataset sintético. Uma calibração por percentil só é válida para a distribuição que
-ela de fato vai filtrar: **recalibrar sempre que `APPROVED_CATEGORIES` mudar**, já
-que restringir/expandir a allowlist muda a distribuição do catálogo carregado. A
-ferramenta escolhe o candidato mais protetor que ainda mantém o pool mínimo (≥
-`TOP_K` em toda a grade `curr × ALLOWED_DEST_OCTANTS × tempo`); se nenhum candidato
-atender ao piso, sinaliza para revisão manual em vez de escolher um valor
-silenciosamente inseguro. Os valores calibrados vão manualmente em
+Também apresenta a curva limiar × consequência para os dois limiares do guardrail
+(`report_threshold_tradeoff`, para arousal e para valência aversiva). Não escolhe
+nada sozinha: calibrar por percentil da distribuição corrente é circular (o limiar
+passa a ser definido pelos dados que deveria filtrar, e se move sempre que a
+composição do catálogo muda — foi o que invalidou duas calibrações por percentil
+anteriores, já removidas do código). Em vez disso, `report_threshold_tradeoff`
+ancora a escolha na semântica da escala afetiva ([-1, 1], psicometricamente
+validada) e usa o tamanho do pior pool na grade (`curr × ALLOWED_DEST_OCTANTS`,
+via `_apply_safety_filter_standalone`) só como checagem de viabilidade, marcando
+como `INVIÁVEL` qualquer limiar que deixaria o pior caso abaixo de `TOP_K` — a
+decisão de onde cortar continua humana. Os valores escolhidos vão manualmente em
 `SAFETY_AROUSAL_THRESHOLD`/`SAFETY_AVERSIVE_VALENCE_THRESHOLD`
-(`sistema_de_recomendacao_v3.py`), como qualquer alteração de código.
+(`sistema_de_recomendacao_v3.py`), com comentário de proveniência descrevendo a
+justificativa semântica (não um percentil), como qualquer alteração de código.
 `verify_guardrail_effective` reconfirma, depois de aplicar os novos limiares, que o
 guardrail de fato bloqueia itens (>0) em todo par `(curr, dest)` de
 `LOW_ENERGY_OCTANTS`/`HIGH_ENERGY_OCTANTS` × `ALLOWED_DEST_OCTANTS` — um guardrail
