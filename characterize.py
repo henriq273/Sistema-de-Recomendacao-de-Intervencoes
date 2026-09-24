@@ -78,9 +78,11 @@ def report_catalog_composition(df: pd.DataFrame) -> None:
 
 def report_simulator_vocabulary(df: pd.DataFrame) -> None:
     """
-    Verifica se os valores referenciados pelos bônus dos simuladores de feedback
-    existem de fato no catálogo carregado. Um bônus que nunca dispara significa que
-    o simulador se comporta diferente do que o código sugere -- não é bug de
+    Verifica se os valores referenciados pelos bônus do simulador de feedback
+    (simulate_feedback_holdout, único perfil existente -- o perfil "principal"
+    anterior foi removido por não ser chamado em nenhum lugar do código) existem
+    de fato no catálogo carregado. Um bônus que nunca dispara significa que o
+    simulador se comporta diferente do que o código sugere -- não é bug de
     execução (nada quebra), é divergência silenciosa entre intenção e efeito.
 
     Adaptado à API real: _MODALIDADE_TO_TIPO (data_source.py) mapeia o catálogo
@@ -92,21 +94,11 @@ def report_simulator_vocabulary(df: pd.DataFrame) -> None:
     empiricamente o que aquele comentário já descreve, em vez de reafirmá-lo às
     cegas.
     """
-    print("=== Vocabulário de Tipo/category: simuladores vs. catálogo real ===")
+    print("=== Vocabulário de Tipo/category: simulador vs. catálogo real ===")
     real_types = set(df["Tipo"].unique())
     print(f"Tipos presentes no catálogo: {sorted(real_types)}")
 
-    print("\n  simulate_feedback (perfil principal, bônus por Tipo):")
-    expected = {"Corporal", "Áudio", "Vídeo", "Jogo"}
-    matched = expected & real_types
-    missing = expected - real_types
-    print(f"    referenciados pelos bônus: {sorted(expected)}")
-    print(f"    presentes no catálogo:     {sorted(matched) or '(nenhum)'}")
-    if missing:
-        print(f"    [ATENÇÃO] ausentes (bônus nunca dispara para estes valores): "
-              f"{sorted(missing)}")
-
-    print("\n  simulate_feedback_holdout (perfil de avaliação/baselines):")
+    print("\n  simulate_feedback_holdout (único perfil, avaliação/baselines/regret/heatmap):")
     has_category = "category" in df.columns and df["category"].notna().any()
     if has_category:
         real_categories = set(df["category"].dropna().unique())
@@ -241,47 +233,6 @@ def report_pool_size_baseline(df: pd.DataFrame, allowed_dest_octants) -> dict:
     return {"raw_results": results}
 
 
-def report_pool_size_with_guardrail(df: pd.DataFrame, allowed_dest_octants) -> dict:
-    """
-    C'. Mesma varredura da seção C, mas aplicando o guardrail de 4 regras
-    (Recommender._apply_safety_filter) com os limiares já calibrados/preenchidos em
-    sysrec.SAFETY_AROUSAL_THRESHOLD / sysrec.SAFETY_AVERSIVE_VALENCE_THRESHOLD.
-    Usado para reconfirmar, após implementar o guardrail, que o pool mínimo real
-    bate com o previsto pela calibração (passo 5 da ordem de execução do plano).
-    """
-    print("\n=== C'. Tamanho de pool na grade completa (COM guardrail aplicado) ===")
-    results = []
-    for curr in range(1, 9):
-        for dest in allowed_dest_octants:
-            tv, ta = sysrec.OCTANT_MAP[dest]
-            for t in sysrec.CONTEXT_DURATIONS:
-                elig = df.index[df["Duracao"] <= t].to_numpy()
-                if len(elig) == 0:
-                    results.append((0, curr, dest, t))
-                    continue
-
-                A = df.loc[elig, "Arousal"].to_numpy(dtype=np.float32)
-                V = df.loc[elig, "Valencia"].to_numpy(dtype=np.float32)
-                r1 = (curr in sysrec.LOW_ENERGY_OCTANTS) & (A > sysrec.SAFETY_AROUSAL_THRESHOLD)
-                r2 = (curr in sysrec.HIGH_ENERGY_OCTANTS) & (A > sysrec.SAFETY_AROUSAL_THRESHOLD)
-                r3 = (ta < 0) & (A > sysrec.SAFETY_AROUSAL_THRESHOLD)
-                r4 = (tv > 0) & (V < sysrec.SAFETY_AVERSIVE_VALENCE_THRESHOLD)
-                blocked = r1 | r2 | r3 | r4
-                safe = elig[~blocked] if blocked.any() and (~blocked).any() else elig
-
-                pool_n = min(sysrec.CANDIDATE_POOL_SIZE, len(safe))
-                results.append((pool_n, curr, dest, t))
-
-    sizes = [r[0] for r in results]
-    print(f"  Contextos avaliados: {len(results)}")
-    print(f"  Pool mínimo: {min(sizes)}  |  Pool médio: {np.mean(sizes):.1f}")
-    below_floor = [r for r in results if r[0] < sysrec.TOP_K]
-    print(f"  Contextos abaixo do piso (TOP_K={sysrec.TOP_K}): {len(below_floor)}")
-    for n, curr, dest, t in below_floor[:10]:
-        print(f"    curr={curr} dest={dest} t={t}min -> {n} itens pós-guardrail")
-    return {"raw_results": results}
-
-
 def _apply_safety_filter_standalone(df: pd.DataFrame, eligible: np.ndarray,
                                      curr_oct: int, dest_oct: int) -> np.ndarray:
     """Réplica pura de Recommender._apply_safety_filter, sem precisar de uma
@@ -397,12 +348,11 @@ def compare_pool_with_without_guardrail(df: pd.DataFrame, allowed_dest_octants) 
     pool elegível COM e SEM o guardrail geométrico -- quantifica exatamente
     quanto ele está custando em tamanho de pool.
 
-    Adaptado do pseudocódigo original do plano: report_pool_size_baseline/
-    report_pool_size_with_guardrail (seções C/C') reimplementam R1-R4 sem checar
-    sysrec.USE_SAFETY_FILTER, então envolvê-las em safety_filter_disabled() não
-    teria efeito algum. Em vez disso, esta função chama
-    _apply_safety_filter_standalone diretamente -- que respeita a flag -- para
-    que o context manager realmente tenha efeito na comparação.
+    Adaptado do pseudocódigo original do plano: report_pool_size_baseline (seção
+    C) reimplementa a elegibilidade sem checar sysrec.USE_SAFETY_FILTER, então
+    envolvê-la em safety_filter_disabled() não teria efeito algum. Em vez disso,
+    esta função chama _apply_safety_filter_standalone diretamente -- que respeita
+    a flag -- para que o context manager realmente tenha efeito na comparação.
     """
     print("=== Pool COM guardrail vs. SEM guardrail (diagnóstico) ===")
     eligible_all = df.index.to_numpy(dtype=int)
@@ -444,145 +394,91 @@ def report_consistency_audit() -> None:
               f"leves={leve_by_dataset.get(dataset, 0):>4}")
 
 
-def calibrate_guardrail_thresholds(df: pd.DataFrame, allowed_dest_octants,
-                                    min_pool_floor: int | None = None) -> dict:
-    """
-    Varre candidatos de limiar de arousal (percentis da distribuição REAL, não
-    valores fixos herdados do sintético) e escolhe o mais protetor (mais baixo)
-    que ainda mantém o pool mínimo, em toda a grade, acima de min_pool_floor.
+@contextmanager
+def _override(module, **kwargs):
+    """Sobrescreve temporariamente atributos de módulo, restaurando os valores
+    originais ao sair -- inclusive em caso de exceção. Generaliza
+    safety_filter_disabled (que só cobria USE_SAFETY_FILTER) para qualquer
+    combinação de constantes -- mesmo padrão já usado em
+    fatigue_diagnostics._override. Uso exclusivo de bancada de diagnóstico."""
+    original = {k: getattr(module, k) for k in kwargs}
+    for k, v in kwargs.items():
+        setattr(module, k, v)
+    try:
+        yield
+    finally:
+        for k, v in original.items():
+            setattr(module, k, v)
 
-    Critério: entre os candidatos que NÃO produzem pool abaixo do piso em nenhum
-    contexto da grade, escolher o de maior proteção (menor limiar de arousal).
-    Como arousal_percentiles está em ordem crescente, o PRIMEIRO candidato válido já
-    é o mais protetor -- não é preciso continuar a busca depois de achá-lo. Se
-    nenhum candidato atender ao piso, reportar o melhor compromisso e sinalizar para
-    revisão manual -- nunca escolher um valor silenciosamente inseguro.
-    """
-    min_pool_floor = sysrec.TOP_K if min_pool_floor is None else min_pool_floor
-    # Faixa original ([50, 60, 70, 75, 80, 85, 90]) supunha catálogo pequeno (~100
-    # itens), onde ser mais restritivo que a mediana arriscava esvaziar o pool.
-    # Ampliada para catálogo maior, onde limiares bem mais protetores ainda
-    # provavelmente mantêm pool confortável.
-    arousal_percentiles = [10, 20, 30, 40, 50, 60, 70, 75, 80, 85, 90]
-    candidates = [float(np.percentile(df["Arousal"], p)) for p in arousal_percentiles]
 
-    print("=== Calibração do limiar de arousal (guardrail, R1) ===")
-    print(f"{'percentil':>10} {'limiar':>8} {'bloqueados (baixa energia)':>28} "
-          f"{'pool mínimo pós-guardrail':>28} {'contextos < piso':>18}")
+def _worst_pool_with_threshold(df: pd.DataFrame, arousal_threshold: float | None = None,
+                                valence_threshold: float | None = None) -> int:
+    """Pior pool pós-guardrail (regras R1-R4 completas, via
+    _apply_safety_filter_standalone -- não uma reimplementação parcial) na grade
+    curr x ALLOWED_DEST_OCTANTS, com um dos limiares hipoteticamente sobrescrito.
+    Usado só para checar viabilidade de um candidato em report_threshold_tradeoff;
+    nunca aplica o limiar de fato (restaura ao sair, via _override)."""
+    overrides = {}
+    if arousal_threshold is not None:
+        overrides["SAFETY_AROUSAL_THRESHOLD"] = float(arousal_threshold)
+    if valence_threshold is not None:
+        overrides["SAFETY_AVERSIVE_VALENCE_THRESHOLD"] = float(valence_threshold)
 
-    best = None
-    for pct, threshold in zip(arousal_percentiles, candidates):
-        blocked_total, checked_total = 0, 0
-        worst_pool = None
-        below_floor = 0
-
+    eligible_all = df.index.to_numpy(dtype=int)
+    worst = None
+    with _override(sysrec, **overrides):
         for curr in range(1, 9):
-            for dest in allowed_dest_octants:
-                for t in sysrec.CONTEXT_DURATIONS:
-                    elig = df.index[df["Duracao"] <= t].to_numpy()
-                    if len(elig) == 0:
-                        continue
-                    safe = elig
-                    if curr in sysrec.LOW_ENERGY_OCTANTS:
-                        arousal = df.loc[elig, "Arousal"].to_numpy()
-                        mask = arousal <= threshold
-                        checked_total += len(elig)
-                        blocked_total += int((~mask).sum())
-                        safe = elig[mask] if mask.any() else elig
-
-                    n = min(sysrec.CANDIDATE_POOL_SIZE, len(safe))
-                    if worst_pool is None or n < worst_pool:
-                        worst_pool = n
-                    if n < min_pool_floor:
-                        below_floor += 1
-
-        blocked_rate = blocked_total / checked_total if checked_total else 0.0
-        print(f"{pct:>10} {threshold:>8.3f} {blocked_rate:>27.1%} "
-              f"{worst_pool:>28} {below_floor:>18}")
-
-        if below_floor == 0 and best is None:
-            # Primeiro candidato válido na varredura ascendente = mais protetor.
-            best = {"threshold": threshold, "percentile": pct, "worst_pool": worst_pool}
-
-    if best is None:
-        print("\n[ATENÇÃO] Nenhum candidato manteve o piso de pool em toda a grade.")
-        print("Revisar manualmente: considerar aumentar CANDIDATE_POOL_SIZE, reduzir")
-        print("min_pool_floor, ou aceitar que alguns contextos terão menos que TOP_K opções.")
-    else:
-        print(f"\nLimiar de arousal escolhido: {best['threshold']:.3f} "
-              f"(percentil {best['percentile']}, pool mínimo garantido {best['worst_pool']})")
-
-    return best
+            for dest in sysrec.ALLOWED_DEST_OCTANTS:
+                safe = _apply_safety_filter_standalone(df, eligible_all, curr, dest)
+                n = min(sysrec.CANDIDATE_POOL_SIZE, len(safe))
+                if worst is None or n < worst:
+                    worst = n
+    return worst
 
 
-def calibrate_valence_threshold(df: pd.DataFrame, allowed_dest_octants,
-                                 min_pool_floor: int | None = None) -> dict:
+def report_threshold_tradeoff(df: pd.DataFrame) -> None:
     """
-    Varredura análoga a calibrate_guardrail_thresholds, para o limiar de valência
-    aversiva (regra R4: bloqueia item com Valencia < limiar quando o destino tem
-    valência positiva). Percentis BAIXOS da distribuição real de valência -- ao
-    contrário do arousal, aqui um limiar MAIOR (menos negativo) é mais protetor
-    (bloqueia mais itens aversivos), então o critério de seleção é invertido: entre
-    os candidatos válidos, o ÚLTIMO da varredura ascendente é o mais protetor (não
-    o primeiro, como em calibrate_guardrail_thresholds).
+    Ferramenta de calibração atual (substitui uma varredura por percentil usada
+    antes, removida por ser circular -- ver histórico). NÃO escolhe nada --
+    apresenta a curva limiar x consequência para uma decisão humana informada, e
+    checa viabilidade (pior pool na grade real). O limiar é uma decisão de
+    segurança ancorada na semântica da escala afetiva ([-1, 1], psicometricamente
+    validada), não um percentil da distribuição corrente do catálogo: calibrar por
+    percentil é circular (o limiar passa a ser definido pelos dados que deveria
+    filtrar, e se move sempre que a composição do catálogo muda -- foi exatamente
+    isso que invalidou a calibração anterior quando
+    safety.auto_approve_clean_categories rodou).
     """
-    min_pool_floor = sysrec.TOP_K if min_pool_floor is None else min_pool_floor
-    # Passo mais fino perto da cauda do que a faixa anterior ([1, 2, 5, 10, 15,
-    # 20, 30]): R4 (valência) não é filtrada por curr_oct como R1/R2/R3 são --
-    # cada ponto percentual aqui custa uma fração do catálogo INTEIRO, não de um
-    # subconjunto por estado, então vale mais resolução perto da cauda.
-    valence_percentiles = [1, 2, 3, 5, 8, 10, 15, 20]
-    candidates = [float(np.percentile(df["Valencia"], p)) for p in valence_percentiles]
+    print("=== Limiar de arousal: trade-off ===")
+    print(f"{'limiar':>8} {'% catálogo bloqueado':>22} {'itens restantes':>18} "
+          f"{'pior pool na grade':>20}")
+    for threshold in np.arange(-0.4, 0.85, 0.1):
+        threshold = float(threshold)
+        blocked = df["Arousal"] > threshold
+        remaining = len(df) - int(blocked.sum())
+        worst_pool = _worst_pool_with_threshold(df, arousal_threshold=threshold)
+        viable = "" if worst_pool >= sysrec.TOP_K else "   <-- INVIÁVEL"
+        print(f"{threshold:>8.2f} {blocked.mean():>21.1%} {remaining:>18} "
+              f"{worst_pool:>20}{viable}")
+    print("\n  Escolha o limiar pela semântica afetiva pretendida (que nível de "
+          "ativação é excessivo para alguém em baixa energia?), usando a coluna "
+          "de viabilidade apenas para descartar valores impraticáveis.")
 
-    print("\n=== Calibração do limiar de valência aversiva (guardrail, R4) ===")
-    print(f"{'percentil':>10} {'limiar':>8} {'bloqueados (destino positivo)':>30} "
-          f"{'pool mínimo pós-guardrail':>28} {'contextos < piso':>18}")
-
-    best = None
-    for pct, threshold in zip(valence_percentiles, candidates):
-        blocked_total, checked_total = 0, 0
-        worst_pool = None
-        below_floor = 0
-
-        for curr in range(1, 9):
-            for dest in allowed_dest_octants:
-                tv = sysrec.OCTANT_MAP[dest][0]
-                for t in sysrec.CONTEXT_DURATIONS:
-                    elig = df.index[df["Duracao"] <= t].to_numpy()
-                    if len(elig) == 0:
-                        continue
-                    safe = elig
-                    if tv > 0:
-                        valencia = df.loc[elig, "Valencia"].to_numpy()
-                        mask = valencia >= threshold
-                        checked_total += len(elig)
-                        blocked_total += int((~mask).sum())
-                        safe = elig[mask] if mask.any() else elig
-
-                    n = min(sysrec.CANDIDATE_POOL_SIZE, len(safe))
-                    if worst_pool is None or n < worst_pool:
-                        worst_pool = n
-                    if n < min_pool_floor:
-                        below_floor += 1
-
-        blocked_rate = blocked_total / checked_total if checked_total else 0.0
-        print(f"{pct:>10} {threshold:>8.3f} {blocked_rate:>29.1%} "
-              f"{worst_pool:>28} {below_floor:>18}")
-
-        if below_floor == 0:
-            # Varredura ascendente (limiar cada vez menos negativo, mais protetor):
-            # sobrescrever a cada candidato válido para manter o ÚLTIMO (mais alto).
-            best = {"threshold": threshold, "percentile": pct, "worst_pool": worst_pool}
-
-    if best is None:
-        print("\n[ATENÇÃO] Nenhum candidato manteve o piso de pool em toda a grade.")
-        print("Revisar manualmente: considerar aumentar CANDIDATE_POOL_SIZE, reduzir")
-        print("min_pool_floor, ou aceitar que alguns contextos terão menos que TOP_K opções.")
-    else:
-        print(f"\nLimiar de valência escolhido: {best['threshold']:.3f} "
-              f"(percentil {best['percentile']}, pool mínimo garantido {best['worst_pool']})")
-
-    return best
+    print("\n=== Limiar de valência aversiva: trade-off ===")
+    print(f"{'limiar':>8} {'% catálogo bloqueado':>22} {'itens restantes':>18} "
+          f"{'pior pool na grade':>20}")
+    for threshold in np.arange(-0.9, 0.05, 0.1):
+        threshold = float(threshold)
+        blocked = df["Valencia"] < threshold
+        remaining = len(df) - int(blocked.sum())
+        worst_pool = _worst_pool_with_threshold(df, valence_threshold=threshold)
+        viable = "" if worst_pool >= sysrec.TOP_K else "   <-- INVIÁVEL"
+        print(f"{threshold:>8.2f} {blocked.mean():>21.1%} {remaining:>18} "
+              f"{worst_pool:>20}{viable}")
+    print("\n  Escolha o limiar pela semântica afetiva pretendida (que grau de "
+          "valência aversiva contradiz o objetivo de um destino de valência "
+          "positiva?), usando a coluna de viabilidade apenas para descartar "
+          "valores impraticáveis.")
 
 
 def verify_guardrail_effective(df: pd.DataFrame, recommender) -> None:
@@ -682,8 +578,11 @@ if __name__ == "__main__":
     print()
     compare_pool_with_without_guardrail(catalog, sysrec.ALLOWED_DEST_OCTANTS)
     print()
-    calibrate_guardrail_thresholds(catalog, sysrec.ALLOWED_DEST_OCTANTS)
-    calibrate_valence_threshold(catalog, sysrec.ALLOWED_DEST_OCTANTS)
+    # report_threshold_tradeoff é a ferramenta de calibração atual: apresenta a
+    # curva limiar x consequência para decisão humana ancorada na semântica da
+    # escala afetiva, não escolhe nada sozinha (a varredura por percentil antiga
+    # foi removida por ser circular -- ver histórico do repositório).
+    report_threshold_tradeoff(catalog)
     print()
 
     # Verificação de efetividade contra os limiares ATUAIS de

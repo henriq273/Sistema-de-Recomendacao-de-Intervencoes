@@ -96,35 +96,41 @@ TIME_FILTER_ENABLED = False
 USE_SAFETY_FILTER = True
 LOW_ENERGY_OCTANTS = (5, 6)      # Triste/Deprimido, Entediado/Cansado
 HIGH_ENERGY_OCTANTS = (3, 4)     # Estressado/Ansioso, Irritado/Raiva
-# Recalibrado com characterize.py (calibrate_guardrail_thresholds /
-# calibrate_valence_threshold) em 2026-09-16, contra o catálogo real pós
-# safety.auto_approve_clean_categories (DATA_BACKEND="json_export",
-# APPROVED_CATEGORIES = GAPED positive/neutral + DEAM/EMOPIA/MEDITATION_LOCAL/
-# MuVi auto-aprovados -- 3627 itens, 5 datasets; ver report_catalog_composition).
-# Recalibração anterior (-0.758/0.192) foi contra o catálogo então 100% GAPED
-# (210 itens) e ficou restritiva demais aqui: aplicada a este catálogo maior,
-# bloqueava 3607/3627 itens nos oitantes de baixa/alta energia (ainda >
-# CANDIDATE_POOL_SIZE, mas bem menos folga que o pretendido). Recalibrar de novo
-# sempre que APPROVED_CATEGORIES mudar -- a distribuição usada aqui reflete só
-# os 5 datasets acima.
-#   Arousal:  percentil 10 da distribuição real, pool mínimo garantido 12/12
-#             (CANDIDATE_POOL_SIZE) em toda a grade de diagnóstico.
+# Proveniência (reescrita em 2026-09-23, verificação "calibração que não
+# converge" -- ver characterize.report_threshold_tradeoff, ferramenta de
+# calibração atual; a varredura por percentil usada antes foi removida do
+# código por ser circular): calibrar por percentil da distribuição corrente é
+# circular -- o limiar passa a ser definido pelos dados que deveria filtrar, e
+# se move sempre que a composição do catálogo muda (foi o que já aconteceu
+# duas vezes: 2026-09-16 duas vezes seguidas, quando auto_approve_clean_categories
+# e depois a correção de R3/R4
+# mudaram a distribuição sob os mesmos números). Os valores abaixo continuam
+# numericamente os de antes (não foram recalculados), mas a justificativa agora é
+# semântica, não percentual:
 #
-# Valência recalibrada de novo em 2026-09-16 (diagnóstico "guardrail filtrando em
-# excesso"): report_guardrail_breakdown revelou que R3 (destino ta<0, ver
-# _apply_safety_filter) e R4 são as DUAS regras sem restrição de curr_oct -- para
-# dest em {7, 8} (ambos com arousal-alvo negativo), R3+R4 juntas bloqueiam o mesmo
-# conjunto de itens para TODO curr_oct, não só LOW/HIGH_ENERGY_OCTANTS. Como
-# CANDIDATE_POOL_SIZE=12 é pequeno frente ao catálogo (3627 itens), o piso de pool
-# usado por calibrate_valence_threshold nunca chega a ser o fator limitante --
-# qualquer percentil até a faixa alta ainda deixa >>12 itens, então a escolha do
-# limiar é essencialmente uma decisão de política (quanto do catálogo aceitar
-# bloquear via uma regra aplicada universalmente), não um mínimo determinado pelos
-# dados. Escolhido percentil 20 (grade mais fina na cauda:
-# [1, 2, 3, 5, 8, 10, 15, 20]), bloqueando ~18.6% do catálogo via R4 sozinha, em
-# vez do percentil 30 anterior (~31.2%) -- ver report_calibration_staleness para
-# reconferir o percentil real implicado sempre que o catálogo mudar de novo.
-#   Valência: percentil 20 da distribuição real, pool mínimo garantido 12/12.
+#   Arousal (SAFETY_AROUSAL_THRESHOLD = -0.526): na escala [-1, 1], valores perto
+#   de -1 são profundamente contemplativos/sedados e perto de +1 são intensamente
+#   ativadores. -0.526 fica na metade inferior da faixa negativa -- a leitura
+#   pretendida é que, para alguém em baixa energia (LOW_ENERGY_OCTANTS) ou já
+#   hiperativado (HIGH_ENERGY_OCTANTS), só conteúdo com arousal solidamente
+#   negativo é seguro oferecer; qualquer ativação sequer moderada (acima deste
+#   ponto) já é considerada excessiva nesses estados.
+#
+#   Valência aversiva (SAFETY_AVERSIVE_VALENCE_THRESHOLD = -0.400): na mesma
+#   escala, -0.400 marca conteúdo claramente para o lado negativo (além do ponto
+#   neutro em 0), não apenas levemente desagradável -- a leitura é que valência
+#   moderada a fortemente negativa contradiz o próprio objetivo de dirigir alguém
+#   a um destino de valência positiva (R4), então é bloqueada.
+#
+# Consequência sobre o catálogo atual (3600 itens, GAPED + DEAM/EMOPIA/
+# MEDITATION_LOCAL/MuVi -- CONSEQUÊNCIA da escolha, não critério dela; reconferir
+# com characterize.report_calibration_staleness sempre que o catálogo mudar de
+# composição): R1 bloqueia ~90% dos itens de alta ativação nos estados
+# LOW/HIGH_ENERGY_OCTANTS; R4 bloqueia ~18% do catálogo em qualquer chamada com
+# destino de valência positiva. report_threshold_tradeoff confirma que o pool pós
+# guardrail nunca cai abaixo do piso (CANDIDATE_POOL_SIZE=12) em toda a faixa
+# semanticamente plausível varrida ([-0.4, 0.8] para arousal, [-0.9, 0.0] para
+# valência) -- a viabilidade não é o fator limitante da escolha.
 SAFETY_AROUSAL_THRESHOLD = -0.526           # itens acima disso são bloqueados (R1/R2/R3)
 SAFETY_AVERSIVE_VALENCE_THRESHOLD = -0.400  # itens abaixo disso são bloqueados (R4)
 # Destinos plausíveis para a grade de diagnóstico/calibração (characterize.py): só
@@ -257,19 +263,47 @@ APPROVED_CATEGORIES = {
     ("MuVi", "music_video"),
 }
 
-# Denylist de palavras-chave, aplicada a nome/tags/category.
+# Denylist de palavras-chave, aplicada a nome/tags/category (correspondência por
+# PALAVRA INTEIRA, com separadores normalizados -- ver safety._matches_denylist_keyword
+# -- não mais por subcadeia: "war" como subcadeia casava "warm"/"award"/"warehouse").
 SAFETY_DENYLIST_KEYWORDS = [
+    # originais
     "mistreatment", "abuse", "mutilation", "gore", "violence", "violation",
     "assault", "torture", "disgust", "contamination", "disease", "wound",
     "war", "atrocity", "norm_violation", "phobia",
+    # variantes morfológicas dos originais: com correspondência por palavra inteira,
+    # "\bviolence\b" deixa de casar "violent", e "\bphobia\b" deixa de casar
+    # compostos como "arachnophobia" (\b não casa no meio de uma palavra) -- por
+    # isso as variantes precisam ser listadas explicitamente em vez de confiar em
+    # correspondência parcial.
+    "abused", "violent", "wounded", "diseased", "mutilated",
+    # lacunas medidas empiricamente contra o catálogo bruto real (verificação
+    # prévia) -- todas com ocorrência > 0; reconferir com safety.audit_denylist_terms.
+    "nude", "nudity", "naked", "erotic",
+    "gun", "guns", "firearm", "weapon", "weapons", "rifle", "pistol",
+    "carcass", "corpse", "cadaver", "dead", "dead bodies",
+    "explosion", "blast", "bomb",
+    "cemetery", "jail", "tornado", "injury", "cockroach", "knife",
+    "flood", "bloody", "funeral", "feces", "tumor", "severed", "kkk",
 ]
 
 # IDs individuais bloqueados após revisão manual, independente de categoria.
 BLOCKED_ITEM_IDS = set()
 
-# Abaixo deste valor de valência normalizada, o item exige aprovação EXPLÍCITA
-# (estar em APPROVED_CATEGORIES) — não passa por default mesmo sem keyword/categoria bloqueada.
+# Abaixo deste valor de valência normalizada, o item exige aprovação EXPLÍCITA POR
+# ITEM (estar em REVIEWED_NEGATIVE_ITEM_IDS) -- não passa por default, mesmo com
+# categoria aprovada. Uma categoria aprovada em bloco não é evidência de que um item
+# específico de valência muito negativa dentro dela foi olhado; por isso a Camada 3
+# (safety.apply_safety_filter) não usa mais "| mask_category" -- correção de um bug
+# de absorção booleana (A & (X | A) ≡ A) que fazia a Camada 3 nunca excluir nada
+# enquanto a Camada 1 estivesse ativa, para qualquer valor deste limiar.
 SAFETY_MIN_VALENCE_REVIEW = -0.6
+
+# Itens de valência abaixo de SAFETY_MIN_VALENCE_REVIEW que foram revisados
+# INDIVIDUALMENTE por um humano e aprovados apesar disso. Começa vazio: sem revisão
+# explícita, valência extrema bloqueia, independente de categoria -- ver
+# review_negative_tail.py para o fluxo de revisão.
+REVIEWED_NEGATIVE_ITEM_IDS: set[str] = set()
 
 # Cold-start (heurística -> DQN)
 # Precisa ser maior que BATCH_SIZE com margem: entre o feedback BATCH_SIZE e
@@ -354,8 +388,33 @@ FATIGUE_HALFLIFE = 10       # em nº de interações; meia-vida do decaimento da
 # t+1..t+(FATIGUE_MIN_GAP-1) -> elegível de novo a partir de t+FATIGUE_MIN_GAP,
 # ainda com a penalidade suave decrescente por cima.
 
-FATIGUE_MIN_GAP = 10
+# Recalibrado de 10 para 3 (verificação empírica "fadiga degenerando em silêncio"):
+# o comportamento originalmente pedido foi item recomendado na 1ª interação,
+# ausente na 2ª e 3ª, podendo voltar na 4ª -- isso É FATIGUE_MIN_GAP=3, não 10.
+# Com 10 e CANDIDATE_POOL_SIZE=12, a invariante abaixo (CANDIDATE_POOL_SIZE >=
+# FATIGUE_MIN_GAP*FATIGUE_ITEMS_PER_ROUND + TOP_K, ou seja 12 >= 13) já estava
+# violada: em contexto fixo repetido, o pool de 12 candidatos não sustenta um
+# ciclo de 10 itens distintos + as TOP_K=3 vagas da rodada atual, e o bloqueio
+# rígido de fadiga degenerava (ver FatigueTracker.blocked_mask).
+FATIGUE_MIN_GAP = 3
 TOP_K = 3                   # itens recomendados por vez
+
+# Itens que entram em cooldown por rodada. Hoje só o item efetivamente EXECUTADO
+# (slot 1) é registrado (FatigueTracker.mark_executed) -- se isso mudar para
+# registrar todos os TOP_K exibidos (padrão "impression-aware"), este valor precisa
+# mudar junto, e a invariante abaixo passa a exigir um pool bem maior.
+FATIGUE_ITEMS_PER_ROUND = 1
+
+_required_pool = FATIGUE_MIN_GAP * FATIGUE_ITEMS_PER_ROUND + TOP_K
+if CANDIDATE_POOL_SIZE < _required_pool:
+    raise ValueError(
+        f"Configuração degenerada: com FATIGUE_MIN_GAP={FATIGUE_MIN_GAP} e "
+        f"FATIGUE_ITEMS_PER_ROUND={FATIGUE_ITEMS_PER_ROUND}, até "
+        f"{FATIGUE_MIN_GAP * FATIGUE_ITEMS_PER_ROUND} itens ficam em cooldown "
+        f"simultaneamente. Com CANDIDATE_POOL_SIZE={CANDIDATE_POOL_SIZE} sobram "
+        f"menos de TOP_K={TOP_K} candidatos num contexto fixo repetido. "
+        f"Requer CANDIDATE_POOL_SIZE >= {_required_pool}, ou reduzir FATIGUE_MIN_GAP."
+    )
 
 # Persistência - conservar pesos, histórico de treino e log de interações
 CHECKPOINT_PATH = "checkpoint_v3.pt"
@@ -887,16 +946,40 @@ class FatigueTracker:
         self.last_seen: dict[int, int] = {}
         self.counter = 0
 
-    def blocked_mask(self, item_indices: np.ndarray) -> np.ndarray:
-        """Bloqueio RÍGIDO: item executado há menos de FATIGUE_MIN_GAP rodadas não
+    def blocked_mask(self, item_indices: np.ndarray, min_survivors: int) -> tuple[np.ndarray, int]:
+        """
+        Bloqueio RÍGIDO: item executado há menos de FATIGUE_MIN_GAP rodadas não
         entra no pool de seleção. Diferente de penalty() -- que só desestimula sem
-        garantir espaçamento -- isto garante o intervalo mínimo."""
-        blocked = np.zeros(len(item_indices), dtype=bool)
-        for i, item_idx in enumerate(item_indices):
-            if item_idx in self.last_seen:
-                delta = self.counter - self.last_seen[item_idx]
-                blocked[i] = delta < FATIGUE_MIN_GAP
-        return blocked
+        garantir espaçamento -- isto garante o intervalo mínimo.
+
+        Relaxação PROGRESSIVA (não reversão binária): se bloquear tudo que deveria
+        deixaria menos de min_survivors itens, libera de volta os que estão em
+        cooldown há MAIS tempo (maior delta = liberado primeiro), só o suficiente
+        para atingir o piso -- em vez de reverter o bloqueio inteiro, que descartava
+        também o cooldown dos itens mostrados agora mesmo. A invariante em
+        FATIGUE_MIN_GAP/CANDIDATE_POOL_SIZE (ver definição de FATIGUE_MIN_GAP) já
+        impede que isto seja necessário no contexto de produção normal -- esta
+        relaxação é a rede de segurança para quando, mesmo assim, um contexto
+        específico ficar sem candidatos suficientes.
+
+        Retorna (máscara de bloqueio, nº de itens liberados pela relaxação).
+        """
+        deltas = np.array([
+            self.counter - self.last_seen[int(i)] if int(i) in self.last_seen else np.inf
+            for i in item_indices
+        ])
+        blocked = deltas < FATIGUE_MIN_GAP
+        n_survivors = int((~blocked).sum())
+        if n_survivors >= min_survivors:
+            return blocked, 0
+
+        deficit = min_survivors - n_survivors
+        blocked_positions = np.where(blocked)[0]
+        # maior delta = em cooldown há mais tempo = candidato a liberar primeiro
+        order = blocked_positions[np.argsort(-deltas[blocked_positions])]
+        released = order[:deficit]
+        blocked[released] = False
+        return blocked, len(released)
 
     def penalty(self, item_indices: np.ndarray) -> np.ndarray:
         """Penalidade suave -- agora só relevante para itens que já passaram do
@@ -956,6 +1039,9 @@ class Recommender:
         self.safety_checked = 0
         self.safety_blocked = 0
         self.recommended_items: set[int] = set()
+        self.fatigue_calls = 0
+        self.fatigue_relaxations = 0
+        self.fatigue_items_relaxed = 0
 
     @property
     def safety_violation_rate(self) -> float:
@@ -964,6 +1050,15 @@ class Recommender:
     @property
     def catalog_coverage(self) -> float:
         return len(self.recommended_items) / len(self.df)
+
+    @property
+    def fatigue_relaxation_rate(self) -> float:
+        """Fração de chamadas de recommend() em que o bloqueio de fadiga precisou
+        relaxar (liberar itens em cooldown de propósito) para manter min_survivors
+        candidatos. Relaxação frequente é sinal de que FATIGUE_MIN_GAP/
+        CANDIDATE_POOL_SIZE estão apertados demais para o contexto testado, mesmo
+        quando a invariante de importação não chega a ser violada."""
+        return self.fatigue_relaxations / self.fatigue_calls if self.fatigue_calls else 0.0
 
     def recommend(self, curr_oct: int, dest_oct: int, time_avail: float, k: int = TOP_K,
                   deterministic: bool = False, register_fatigue: bool = True) -> list[dict]:
@@ -1005,11 +1100,17 @@ class Recommender:
         pool_idx, pool_dist = self._candidate_pool(eligible, curr_oct, dest_oct)
 
         # Bloqueio rígido de fadiga: remove do pool itens mostrados há menos de
-        # FATIGUE_MIN_GAP interações. Nunca esvazia o pool -- mesma garantia dos
-        # demais filtros (guardrail, curadoria): se o bloqueio deixaria o pool
-        # vazio, reverte.
-        fatigue_blocked = self.fatigue.blocked_mask(pool_idx)
-        if fatigue_blocked.any() and not fatigue_blocked.all():
+        # FATIGUE_MIN_GAP interações. Relaxação PROGRESSIVA (não reversão binária --
+        # ver FatigueTracker.blocked_mask): se o bloqueio deixaria menos de k
+        # sobreviventes, libera de volta os itens em cooldown há mais tempo, só o
+        # suficiente para manter k candidatos, em vez de descartar o bloqueio inteiro
+        # (o que também perdoaria os itens mostrados agora mesmo).
+        self.fatigue_calls += 1
+        fatigue_blocked, n_relaxed = self.fatigue.blocked_mask(pool_idx, min_survivors=k)
+        if n_relaxed > 0:
+            self.fatigue_relaxations += 1
+            self.fatigue_items_relaxed += n_relaxed
+        if not fatigue_blocked.all():
             pool_idx, pool_dist = pool_idx[~fatigue_blocked], pool_dist[~fatigue_blocked]
 
         user_state = self.feature_space.user_state(curr_oct, dest_oct, time_avail)
@@ -1330,29 +1431,11 @@ def _simulate(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> tuple[
     return reward, next_oct
 
 
-def simulate_feedback(curr_oct: int, dest_oct: int, item: pd.Series) -> tuple[float, int]:
-    """
-    Simula o feedback do usuário. Retorna (recompensa_continua, proximo_oitante).
-    Perfil "principal", usado nos testes offline padrão.
-    """
-    def bonus(octant: int, item_: pd.Series) -> float:
-        b = 0.0
-        if octant == 4 and item_["Tipo"] == "Corporal":
-            b += 0.1
-        if octant == 3 and item_["Tipo"] == "Áudio":
-            b += 0.1
-        if octant in LOW_ENERGY_OCTANTS and item_["Tipo"] in ("Vídeo", "Jogo"):
-            b += 0.05
-        return b
-
-    return _simulate(curr_oct, dest_oct, item, bonus)
-
-
 def simulate_feedback_holdout(curr_oct: int, dest_oct: int, item: pd.Series) -> tuple[float, int]:
     """
-    Perfil alternativo de feedback, com bônus contextuais diferentes de simulate_feedback.
-    Uso exclusivo em avaliação (baselines): treinar e avaliar contra perfis distintos é o
-    que evita medir imitação em vez de generalização.
+    Simula o feedback do usuário. Retorna (recompensa_continua, proximo_oitante).
+    Uso exclusivo em avaliação (baselines/regret/heatmap) -- nunca para treinar o
+    modelo de produção (ver docstring da seção acima).
 
     Bônus com dois perfis, escolhidos automaticamente pela presença da coluna
     `category` (só existe em itens do catálogo real -- data_source.
@@ -2103,7 +2186,7 @@ def _run_offline_evaluation() -> None:
 
 
 if __name__ == "__main__":
-    # python sistema_de_recomendacao_v2.py --eval roda a bancada de teste offline
+    # python sistema_de_recomendacao_v3.py --eval roda a bancada de teste offline
     # (simulador + baselines) em vez do loop interativo de produção.
     if "--eval" in sys.argv:
         _run_offline_evaluation()

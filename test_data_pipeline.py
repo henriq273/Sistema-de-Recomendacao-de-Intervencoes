@@ -146,6 +146,15 @@ DOCS_IMAGE = [
         "ratings": {"valenceNormalized": -0.9, "arousalNormalized": 0.5},
         "tags": [], "category": "aversive_research", "sourceMeta": {"dataset": "GAPED"},
     },
+    # 10) imagem com valência muito negativa, categoria APROVADA -> testa a Camada 3
+    #     isolada (regressão do bug de absorção booleana: com "| mask_category" a
+    #     Camada 3 nunca excluía nada de uma categoria já aprovada, para nenhum
+    #     valor de SAFETY_MIN_VALENCE_REVIEW -- ver test_camada3_blocks_extreme_valence).
+    {
+        "_id": "i3", "title": "Paisagem perturbadora",
+        "ratings": {"valenceNormalized": -0.8, "arousalNormalized": 0.4},
+        "tags": [], "category": "nature", "sourceMeta": {"dataset": "OASIS"},
+    },
 ]
 
 
@@ -242,6 +251,78 @@ def test_approved_category_filters_correctly():
         "descartes reportados por motivo (va_ausente)",
         "va_ausente=2" in output,
         f"saída: {output.strip().splitlines()[-1] if output else '(vazia)'}",
+    )
+
+    # Teste 6 (Camada 3 isolada): i3 tem valência muito negativa E categoria
+    # aprovada ("nature") -- é exatamente o caso que o bug de absorção booleana
+    # deixava passar (mask_category & (X | mask_category) ≡ mask_category). Com a
+    # correção, i3 é excluído mesmo com categoria aprovada, a menos que esteja em
+    # REVIEWED_NEGATIVE_ITEM_IDS.
+    _check(
+        "6. Camada 3 bloqueia valência extrema mesmo com categoria aprovada "
+        "(regressão do bug de absorção booleana)",
+        "i3" not in ids,
+        f"ids presentes: {sorted(ids)}",
+    )
+
+
+def test_camada3_independent_of_category_approval():
+    """Teste 7: a mesma valência extrema com categoria aprovada continua excluída
+    até ser revisada individualmente (REVIEWED_NEGATIVE_ITEM_IDS) -- e passa a
+    entrar assim que revisada, sem depender de mudar a categoria. Isola a Camada 3
+    do resto da curadoria (não precisa recarregar o catálogo completo)."""
+    df = pd.DataFrame({
+        "item_id": ["low_v", "ok_v"],
+        "valencia_norm": [-0.8, 0.1],
+        "dataset": ["OASIS", "OASIS"],
+        "category": ["nature", "nature"],
+        "nome": ["item baixo", "item ok"],
+        "tags": [[], []],
+    })
+    sysrec.APPROVED_CATEGORIES.clear()
+    sysrec.APPROVED_CATEGORIES.add(("OASIS", "nature"))
+    sysrec.BLOCKED_ITEM_IDS.clear()
+    sysrec.REVIEWED_NEGATIVE_ITEM_IDS.clear()
+
+    safe = safety.apply_safety_filter(df)
+    _check(
+        "7a. item de valência extrema com categoria aprovada é excluído sem revisão individual",
+        "low_v" not in set(safe["item_id"]) and "ok_v" in set(safe["item_id"]),
+        f"ids presentes: {sorted(safe['item_id'])}",
+    )
+
+    sysrec.REVIEWED_NEGATIVE_ITEM_IDS.add("low_v")
+    safe = safety.apply_safety_filter(df)
+    _check(
+        "7b. item revisado individualmente (REVIEWED_NEGATIVE_ITEM_IDS) passa a entrar",
+        "low_v" in set(safe["item_id"]),
+        f"ids presentes: {sorted(safe['item_id'])}",
+    )
+    sysrec.REVIEWED_NEGATIVE_ITEM_IDS.clear()
+
+
+def test_denylist_word_boundary_and_normalization():
+    """Teste 8: correspondência por PALAVRA INTEIRA (não subcadeia) -- "war" não
+    deve casar "edwards"/"forwards"/"paowar" (falsos positivos reais medidos contra
+    o catálogo real), mas "war" isolado e "norm_violation" (com underscore, tag
+    típica do GAPED) continuam batendo -- _normalize_haystack converte _/-// em
+    espaço antes da fronteira de palavra."""
+    no_match_row = {"nome": "Edwards Forwards Paowar", "tags": [], "category": ""}
+    _check(
+        "8a. 'war' não casa subcadeias (edwards/forwards/paowar)",
+        not safety._matches_denylist_keyword(no_match_row),
+        no_match_row,
+    )
+
+    war_row = {"nome": "Cena de guerra", "tags": ["war zone"], "category": ""}
+    _check("8b. 'war' isolado continua sendo detectado",
+           safety._matches_denylist_keyword(war_row), war_row)
+
+    underscore_row = {"nome": "Imagem neutra", "tags": ["norm_violation"], "category": ""}
+    _check(
+        "8c. termo com underscore na tag ('norm_violation') é detectado após normalização",
+        safety._matches_denylist_keyword(underscore_row),
+        underscore_row,
     )
 
 
@@ -769,12 +850,14 @@ def test_fatigue_blocked_mask_correctness():
     tracker.advance_round()     # counter vira 2
 
     # counter agora é 2: delta(10)=2-0=2, delta(20)=2-1=1, delta(30)=nunca executado.
-    mask = tracker.blocked_mask(np.array([10, 20, 30]))
+    # min_survivors=0: sem piso, a relaxação progressiva não entra em ação -- testa
+    # só o bloqueio bruto.
+    mask, n_relaxed = tracker.blocked_mask(np.array([10, 20, 30]), min_survivors=0)
     expected = np.array([2 < sysrec.FATIGUE_MIN_GAP, 1 < sysrec.FATIGUE_MIN_GAP, False])
     _check(
         "FatigueTracker.blocked_mask bloqueia deltas < FATIGUE_MIN_GAP e libera o resto",
-        np.array_equal(mask, expected),
-        f"mask={mask} expected={expected}",
+        np.array_equal(mask, expected) and n_relaxed == 0,
+        f"mask={mask} expected={expected} n_relaxed={n_relaxed}",
     )
 
 
@@ -796,13 +879,91 @@ def test_fatigue_only_tracks_executed_items():
     # Simula execução de apenas UM dos itens mostrados.
     executed_id = results[0]["item_idx"]
     recommender.fatigue.mark_executed(executed_id)
-    mask = recommender.fatigue.blocked_mask(df.index.to_numpy())
+    mask, _ = recommender.fatigue.blocked_mask(df.index.to_numpy(), min_survivors=0)
     blocked_ids = set(df.index.to_numpy()[mask])
     _check(
         "só o item executado entra em cooldown -- os demais itens mostrados "
         "(não escolhidos) continuam livres",
         blocked_ids == {executed_id},
         f"blocked_ids={blocked_ids} executed_id={executed_id} shown_ids={shown_ids}",
+    )
+
+
+def test_fatigue_relaxation_releases_oldest_first():
+    """Correção A: quando o bloqueio deixaria menos de min_survivors itens, a
+    relaxação progressiva libera os itens em cooldown há MAIS TEMPO (maior delta)
+    primeiro -- nunca os recém-mostrados. Também confirma n_relaxed reportado."""
+    tracker = sysrec.FatigueTracker()
+    # item 1 executado no counter=0 (mais antigo), item 2 no counter=1, item 3 no
+    # counter=2 (mais recente) -- todos ficam em cooldown até counter=2+FATIGUE_MIN_GAP.
+    tracker.mark_executed(1)
+    tracker.advance_round()
+    tracker.mark_executed(2)
+    tracker.advance_round()
+    tracker.mark_executed(3)
+    # counter=2: delta(1)=2, delta(2)=1, delta(3)=0 -- todos < FATIGUE_MIN_GAP (>=3).
+
+    mask, n_relaxed = tracker.blocked_mask(np.array([1, 2, 3]), min_survivors=2)
+    released = {item for item, blocked in zip([1, 2, 3], mask) if not blocked}
+    _check(
+        "relaxação libera os itens de MAIOR delta primeiro (item 1, depois item 2 "
+        "-- nunca o 3, recém-mostrado)",
+        n_relaxed == 2 and released == {1, 2},
+        f"mask={mask} n_relaxed={n_relaxed} released={released}",
+    )
+
+    # min_survivors=0: nenhuma relaxação necessária, todos continuam bloqueados.
+    mask0, n_relaxed0 = tracker.blocked_mask(np.array([1, 2, 3]), min_survivors=0)
+    _check(
+        "sem piso (min_survivors=0), nenhuma relaxação ocorre",
+        n_relaxed0 == 0 and mask0.all(),
+        f"mask0={mask0} n_relaxed0={n_relaxed0}",
+    )
+
+
+def test_fatigue_min_gap_pool_invariant_raises_on_violation():
+    """Correção B: uma configuração degenerada (CANDIDATE_POOL_SIZE menor que
+    FATIGUE_MIN_GAP*FATIGUE_ITEMS_PER_ROUND + TOP_K) deve levantar ValueError --
+    verificada aqui reexecutando a mesma checagem do módulo com valores que a
+    violam, sem precisar reimportar o módulo (o que rodaria efeitos colaterais de
+    import indesejados nos testes)."""
+    gap, items_per_round, top_k, pool = 10, 1, 3, 12  # a configuração antiga, degenerada
+    required = gap * items_per_round + top_k
+    raised = False
+    try:
+        if pool < required:
+            raise ValueError(
+                f"Configuração degenerada: requer CANDIDATE_POOL_SIZE >= {required}."
+            )
+    except ValueError:
+        raised = True
+    _check(
+        "invariante FATIGUE_MIN_GAP*FATIGUE_ITEMS_PER_ROUND+TOP_K <= CANDIDATE_POOL_SIZE "
+        "detecta a configuração antiga (10, 1, 3, 12) como degenerada",
+        raised,
+        f"required={required} pool={pool}",
+    )
+    _check(
+        "a configuração vigente hoje (FATIGUE_MIN_GAP/CANDIDATE_POOL_SIZE) satisfaz a invariante",
+        sysrec.CANDIDATE_POOL_SIZE >= sysrec.FATIGUE_MIN_GAP * sysrec.FATIGUE_ITEMS_PER_ROUND + sysrec.TOP_K,
+        f"CANDIDATE_POOL_SIZE={sysrec.CANDIDATE_POOL_SIZE} FATIGUE_MIN_GAP={sysrec.FATIGUE_MIN_GAP} "
+        f"FATIGUE_ITEMS_PER_ROUND={sysrec.FATIGUE_ITEMS_PER_ROUND} TOP_K={sysrec.TOP_K}",
+    )
+
+
+def test_fatigue_relaxation_rate_zero_when_comfortable():
+    """Correção 1.5: fatigue_relaxation_rate deve ser 0 numa configuração folgada
+    (contexto variado, catálogo com folga confortável de itens)."""
+    recommender, df = _build_tiny_recommender(n_items=sysrec.FATIGUE_MIN_GAP + sysrec.TOP_K + 5)
+    for i in range(10):
+        results = recommender.recommend(curr_oct=1, dest_oct=1, time_avail=60, k=sysrec.TOP_K)
+        if results:
+            recommender.fatigue.mark_executed(results[0]["item_idx"])
+    _check(
+        "fatigue_relaxation_rate é 0 em configuração folgada",
+        recommender.fatigue_relaxation_rate == 0.0,
+        f"fatigue_relaxation_rate={recommender.fatigue_relaxation_rate} "
+        f"relaxations={recommender.fatigue_relaxations} calls={recommender.fatigue_calls}",
     )
 
 
@@ -965,11 +1126,16 @@ def main() -> None:
     test_pymongo_import_is_local_not_module_level()
     test_empty_allowlist_returns_empty_catalog()
     test_approved_category_filters_correctly()
+    test_camada3_independent_of_category_approval()
+    test_denylist_word_boundary_and_normalization()
     test_feature_space_schema_retains_diagnostic_columns()
     test_safety_filter_r2_blocks_high_energy_octant()
     test_safety_filter_never_empties_eligible()
     test_fatigue_blocked_mask_correctness()
     test_fatigue_only_tracks_executed_items()
+    test_fatigue_relaxation_releases_oldest_first()
+    test_fatigue_min_gap_pool_invariant_raises_on_violation()
+    test_fatigue_relaxation_rate_zero_when_comfortable()
     test_fatigue_never_empties_pool()
     test_time_filter_toggle()
     test_select_slots_slot1_always_greedy_argmax()
