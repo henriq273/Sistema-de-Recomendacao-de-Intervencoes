@@ -375,6 +375,118 @@ O simulador de feedback usado aqui (`simulate_feedback_holdout`) usa bônus por
 `category` contra o catálogo real (ex.: GAPED "positive"/"neutral") em vez de
 Tipo/Indoor, que degeneravam lá — ver a docstring da função.
 
+### Avaliação multi-seed (`multiseed.py`)
+
+`--eval` com uma única seed (`SEED=42`) não distingue "o agente é melhor" de "esta
+seed específica favoreceu o agente". `multiseed.py` roda o experimento inteiro em
+**réplicas** independentes (`N_REPLICATES`, cada uma com um `Agent` novo, do zero) e
+agrega entre elas — a unidade de análise passa a ser a réplica, não o episódio
+(`_bootstrap_ci` legado reamostra episódios de uma única execução, o que ignora
+variância entre seeds e trata como independentes episódios correlacionados pelo
+aprendizado do agente; os intervalos multi-seed são mais largos, e são os honestos).
+
+Selecionado por `SEED_MODE` em `sistema_de_recomendacao_v3.py`:
+
+```python
+SEED_MODE = "single"        # padrão -- caminho legado intocado, reproduzível bit a bit
+SEED_MODE = "multi_fixed"   # N réplicas, seeds derivadas deterministicamente de SEED
+SEED_MODE = "multi_random"  # N réplicas, seed raiz de entropia real do SO, registrada
+```
+
+```bash
+python sistema_de_recomendacao_v3.py --eval   # dispara multiseed.py quando SEED_MODE != "single"
+```
+
+- **Números aleatórios comuns (CRN).** Toda a aleatoriedade de cada episódio
+  (contexto, teste de execução, ruído do score, sorteio do braço aleatório) é
+  pré-gerada uma vez por réplica (`pregenerate_randomness`) e dada a **todos** os
+  braços igualmente — só o item escolhido difere entre eles. Isso torna os braços
+  comparáveis entre si e estáveis à adição de novos braços (testado: adicionar um
+  braço fictício não altera as recompensas dos braços existentes). `_simulate`/
+  `simulate_feedback_holdout` aceitam `u_exec`/`z_noise` pré-gerados de forma
+  **retrocompatível** — sem eles (padrão, `None`), o comportamento é idêntico ao
+  legado, inclusive a ordem de consumo do gerador global; verificado byte a byte
+  contra `tests/golden/eval_single_seed.txt` (capturado antes desta mudança).
+- **`seeded_scope`** aplica uma seed ao estado global (`random`/`numpy`/`torch`)
+  dentro de um `with` e restaura o estado **anterior** ao sair (não reinicia o
+  fluxo) — por isso o resultado de uma réplica não depende da ordem em que as
+  réplicas rodam.
+- **Rastreabilidade.** Cada execução grava `results/multiseed/<timestamp>_<modo>/`:
+  `manifest.json` (entropia raiz, seed de cada réplica, config completa,
+  impressão digital do catálogo, commit git — gravado **antes** da primeira
+  réplica, para não se perder se a execução falhar no meio), um `.npz` por
+  réplica, e `summary.json`/`summary.npz` com a agregação. Retomar uma execução
+  interrompida: `multiseed.run_multiseed_evaluation(resume_dir=...)` — confere
+  que catálogo e config batem com o manifesto antes de reaproveitar réplicas já
+  rodadas.
+- **`multi_random`** obtém a seed raiz de entropia real do SO (128 bits, via
+  `numpy.random.SeedSequence()`) — não-determinística e imprevisível, mas os
+  fluxos derivados dela são pseudo-aleatórios, o que permite regenerar a execução
+  inteira depois colando a entropia registrada em `REPLAY_ENTROPY`. Útil só para
+  confirmação **fora da amostra de seeds** ao final do desenvolvimento (ajustar
+  sempre com `multi_fixed`, confirmar uma vez com `multi_random` antes de reportar
+  um resultado final) — rodar `multi_random` durante o desenvolvimento torna
+  impossível saber se uma diferença veio do código ou das seeds.
+- **Comparação pareada** (`agent_online` vs. `conteudo_puro`, na janela final de
+  episódios) via teste de Wilcoxon pareado (`scipy`, dependência só desta bancada)
+  ou teste do sinal exato como *fallback* sem dependência.
+- **Pseudo-regret** opcional (`MULTISEED_INCLUDE_REGRET`): diferente do regret
+  cumulativo de `regret_curve` (que compara contra recompensa **realizada**, e
+  pode ser negativo por ruído amostral), o pseudo-regret compara valor esperado
+  contra valor esperado — não-negativo por construção.
+- **Isolamento da produção**: nunca chama `Agent.save()`, nunca escreve no log de
+  interações, nunca instancia `Recommender`/`FatigueTracker`, nunca é chamado por
+  `main()`.
+
+### Seleção dos slots e ablação do MMR (`selection_ablation.py`)
+
+Os baselines e o multi-seed medem o `argmax` de **um** item; o MMR só atua na lista
+de 3, então nunca tinha sido medido. `SELECTION_MODE` (em
+`sistema_de_recomendacao_v3.py`) escolhe como `_select_slots` preenche a lista — os
+três modos compartilham todo o pipeline até o `adjusted` score e diferem só aqui:
+
+```python
+SELECTION_MODE = "full"    # slot 1 argmax + slot exploratório + MMR nos demais (padrão)
+SELECTION_MODE = "no_mmr"  # igual, mas os demais slots por guloso -- desliga o MMR
+SELECTION_MODE = "greedy"  # top-k determinístico por `adjusted`, sem exploração
+```
+
+O modo é impresso no início da sessão interativa e gravado em cada registro de
+`interaction_log.jsonl` (`selection_mode`): as propensões dependem dele, então
+**o modo precisa ser fixado antes do piloto e não mudar durante ele**. O
+`Recommender` mantém um **contador de inércia** do MMR (`mmr_report()`, impresso ao
+fim da sessão): quantas vezes o MMR escolheu o mesmo item que o guloso, e por quê —
+pool homogêneo (a similaridade é igual para todos os candidatos; nenhum `λ`
+resolve) ou `λ` alto demais (há diferença de similaridade, mas o peso a ignora).
+
+```bash
+python sistema_de_recomendacao_v3.py --eval-selection
+```
+
+roda a ablação: `greedy`, `no_mmr` e `full` com a varredura `λ ∈ {1,0; 0,9; 0,8;
+0,7; 0,5; 0,3}`, em dois regimes — **frio** (agente recém-instanciado, score dominado
+pela heurística de proximidade) e **quente** (agente treinado pelo mesmo
+procedimento do multi-seed e depois congelado, score dominado pela DQN). Mede
+métricas de **lista** (diversidade no espaço de features que o MMR usa, nº de
+modalidades/categorias, espalhamento V-A, valor esperado médio e do slot 1, e o teto
+de diversidade existente no pool) e a utilidade escolhida por um usuário anônimo
+com **afinidade latente por modalidade** (varredura de escala `0 / 0,1 / 0,25 /
+0,5` — uma hipótese sobre o usuário, não um dado; reportar sempre a varredura
+inteira). Segue `SEED_MODE`: em `"single"`, uma réplica, valores descritivos; em
+`"multi_fixed"`/`"multi_random"`, comparações pareadas por réplica (`full − no_mmr`,
+`no_mmr − greedy`, `full − greedy`). Resultados em
+`results/selection_ablation/<timestamp>_<modo>/` (manifesto gravado antes de rodar).
+
+Garantias verificadas por teste: com `λ = 1,0`, `full` retorna exatamente as
+mesmas listas e propensões que `no_mmr`; partindo do mesmo estado do gerador,
+`full` e `no_mmr` sorteiam o mesmo slot exploratório (só os slots do MMR diferem);
+`greedy` não consome números aleatórios; o contador é passivo; o agente fica
+congelado durante a comparação (`learn_from_feedback` levanta se chamado); e com
+`SELECTION_MODE = "full"` a saída de `--eval` continua idêntica à referência.
+Diferença em relação à especificação original: o slot 1 é sempre o `argmax` (não
+sorteado por softmax), então `greedy` e `no_mmr` só diferem quando o slot
+exploratório é sorteado.
+
 ## 4. Rodar o programa
 
 Loop interativo de recomendação + feedback (carrega/salva `checkpoint_v3.pt` e grava

@@ -46,7 +46,43 @@ import torch.nn as nn
 DATASET_PATH = "dataset.csv"   # nome simples ou caminho absoluto (ex.: caminho do Drive)
 
 # Reprodutibilidade
+# Linha de base: não alterar sem motivo documentado. É a seed do modo "single",
+# que preserva o caminho de avaliação legado bit a bit -- ver multiseed.py e
+# tests/golden/eval_single_seed.txt (referência capturada antes da introdução do
+# motor multi-seed).
 SEED = 42
+
+# ---------- Seeds e réplicas (avaliação offline apenas -- multiseed.py) ----------
+# "single"       -> caminho legado intocado, uma execução com SEED (padrão)
+# "multi_fixed"  -> N réplicas, seeds derivadas deterministicamente de SEED
+# "multi_random" -> N réplicas, seed raiz obtida de entropia do SO e registrada
+SEED_MODE = "single"
+
+N_REPLICATES = 10                 # >= 6 para Wilcoxon bilateral poder atingir p<0,05
+N_EPISODES_PER_REPLICATE = 3000
+FINAL_WINDOW_FRACTION = 0.2       # fração final dos episódios = desempenho convergido
+LEARNING_CURVE_SMOOTHING = 100    # janela da média móvel na curva de aprendizado
+
+# Reproduzir uma execução multi_random anterior: colar aqui a entropia raiz
+# registrada no manifesto daquela execução. None = entropia nova do SO.
+REPLAY_ENTROPY = None
+
+MULTISEED_RESULTS_DIR = "results/multiseed"
+# True só se main()/produção passar a inicializar o Agent com warm-start -- hoje
+# não inicializa (Agent(df, feature_space) sobe com pesos aleatórios), então o
+# padrão é False e espelha a produção real. Ver run_replicate em multiseed.py.
+MULTISEED_INCLUDE_WARMSTART = False
+MULTISEED_INCLUDE_REGRET = False     # ver build_expected_value_table em multiseed.py
+
+_VALID_SEED_MODES = ("single", "multi_fixed", "multi_random")
+if SEED_MODE not in _VALID_SEED_MODES:
+    raise ValueError(f"SEED_MODE inválido: {SEED_MODE!r}. Use um de {_VALID_SEED_MODES}.")
+if REPLAY_ENTROPY is not None and SEED_MODE != "multi_random":
+    raise ValueError("REPLAY_ENTROPY só tem efeito com SEED_MODE='multi_random'.")
+if SEED_MODE != "single" and N_REPLICATES < 6:
+    print(f"[aviso] N_REPLICATES={N_REPLICATES}: com menos de 6 réplicas, o teste "
+          f"de Wilcoxon bilateral não consegue atingir p<0,05 em nenhuma hipótese "
+          f"(mínimo com N=5 é 0,0625). A comparação estatística fica sem poder.")
 
 # Rede e otimização
 HIDDEN_DIMS = (128, 64, 32)
@@ -366,7 +402,22 @@ def feedback_level_to_reward(level: int) -> float:
 # removida: não há mais sorteio no slot 1.
 EXPLORE_TEMPERATURE = 1.0   # temperatura do slot exploratório (maior = mais diverso)
 P_EXPLORE_SLOT = 0.5        # probabilidade de um dos slots ser exploratório
-MMR_LAMBDA = 0.7            # 0.7*relevância - 0.3*similaridade (diversidade da lista)
+MMR_LAMBDA = 0.7            # 0.7*relevância - 0.3*similaridade; com 1.0, idêntico a "no_mmr"
+
+# ---------- Seleção dos slots da lista (Recommender._select_slots) ----------
+# "full"   -> slot 1 argmax + slot exploratório (P_EXPLORE_SLOT) + MMR nos demais (atual)
+# "no_mmr" -> igual, mas os demais slots preenchidos por guloso em `adjusted` (MMR desligado)
+# "greedy" -> top-k determinístico por `adjusted`, sem exploração
+# Para desligar o MMR: SELECTION_MODE = "no_mmr" -- é a única linha a mudar. O modo
+# precisa ficar FIXO durante o piloto: as propensões registradas em
+# interaction_log.jsonl dependem dele (ver campo "selection_mode" de cada registro).
+SELECTION_MODE = "full"
+MMR_HOMOGENEOUS_EPS = 1e-3  # spread de similaridade abaixo disto = pool homogêneo (contador de inércia)
+
+_VALID_SELECTION_MODES = ("full", "no_mmr", "greedy")
+if SELECTION_MODE not in _VALID_SELECTION_MODES:
+    raise ValueError(f"SELECTION_MODE inválido: {SELECTION_MODE!r}. "
+                     f"Use um de {_VALID_SELECTION_MODES}.")
 FATIGUE_LAMBDA = 0.5        # peso máximo da penalidade de fadiga
 FATIGUE_HALFLIFE = 10       # em nº de interações; meia-vida do decaimento da penalidade
 # Nº mínimo de rodadas executadas antes de um item poder reaparecer (bloqueio
@@ -1042,6 +1093,53 @@ class Recommender:
         self.fatigue_calls = 0
         self.fatigue_relaxations = 0
         self.fatigue_items_relaxed = 0
+        self.last_pool_idx: np.ndarray | None = None  # diagnóstico: pool da última chamada
+        self.reset_mmr_stats()
+
+    def reset_mmr_stats(self) -> None:
+        self.mmr_stats = {"steps": 0, "diverged": 0, "inert_homogeneous": 0,
+                          "inert_lambda_bound": 0, "spread_sum": 0.0,
+                          "relevance_sacrificed_sum": 0.0, "similarity_reduced_sum": 0.0}
+
+    def _record_mmr_step(self, adjusted: np.ndarray, remaining: list, sims: list,
+                         greedy_pos: int, mmr_pos: int) -> None:
+        """Contador de inércia do MMR -- só conta, não altera nenhuma escolha nem
+        consome o gerador. Inércia = o MMR escolher o mesmo item que o guloso
+        escolheria. Separa as duas causas, que têm correções diferentes:
+          - pool homogêneo: a similaridade com os já escolhidos é praticamente igual
+            para todos os candidatos (spread < MMR_HOMOGENEOUS_EPS), a penalidade
+            vira constante e não reordena nada -- nenhum lambda resolve;
+          - lambda alto demais: há diferença de similaridade, mas ela não compensa a
+            diferença de score -- baixar lambda resolve.
+        Condição exata para o MMR trocar o guloso g por c:
+            lambda*(adjusted[g] - adjusted[c]) < (1 - lambda)*(sim[g] - sim[c])."""
+        s = self.mmr_stats
+        sims = np.asarray(sims)
+        spread = float(sims.max() - sims.min())
+        s["steps"] += 1
+        s["spread_sum"] += spread
+        if mmr_pos != greedy_pos:
+            s["diverged"] += 1
+            i_g, i_m = remaining.index(greedy_pos), remaining.index(mmr_pos)
+            s["relevance_sacrificed_sum"] += float(adjusted[greedy_pos] - adjusted[mmr_pos])
+            s["similarity_reduced_sum"] += float(sims[i_g] - sims[i_m])
+        elif spread < MMR_HOMOGENEOUS_EPS:
+            s["inert_homogeneous"] += 1
+        else:
+            s["inert_lambda_bound"] += 1
+
+    def mmr_report(self) -> dict:
+        s = self.mmr_stats
+        n, d = s["steps"], s["diverged"]
+        return {
+            "mmr_steps": n,
+            "inertia_rate": 1 - d / n if n else None,
+            "inert_by_homogeneous_pool": s["inert_homogeneous"] / n if n else None,
+            "inert_by_lambda": s["inert_lambda_bound"] / n if n else None,
+            "mean_similarity_spread": s["spread_sum"] / n if n else None,
+            "mean_relevance_sacrificed_when_diverged": s["relevance_sacrificed_sum"] / d if d else None,
+            "mean_similarity_reduced_when_diverged": s["similarity_reduced_sum"] / d if d else None,
+        }
 
     @property
     def safety_violation_rate(self) -> float:
@@ -1061,8 +1159,16 @@ class Recommender:
         return self.fatigue_relaxations / self.fatigue_calls if self.fatigue_calls else 0.0
 
     def recommend(self, curr_oct: int, dest_oct: int, time_avail: float, k: int = TOP_K,
-                  deterministic: bool = False, register_fatigue: bool = True) -> list[dict]:
+                  deterministic: bool = False, register_fatigue: bool = True,
+                  selection_mode: str | None = None,
+                  mmr_lambda: float | None = None) -> list[dict]:
         """
+        selection_mode / mmr_lambda: sobrescrita POR CHAMADA de SELECTION_MODE /
+        MMR_LAMBDA (padrão None = usar a configuração global), para que a bancada de
+        ablação (selection_ablation.py) compare modos na mesma execução sem alterar
+        a configuração. O caminho de produção (_run_interaction) nunca passa esses
+        parâmetros. Ver Recommender._select_slots.
+
         deterministic=True: seleção puramente por argmax do score ajustado -- sem
         softmax no slot exploratório, sem embaralhamento da cauda. Usado SOMENTE por
         diagnósticos que precisam isolar sensibilidade ao estado da variação
@@ -1128,9 +1234,15 @@ class Recommender:
         # "ok" com desvio alto sinaliza opiniões divididas (bimodal), não indiferença.
         reward_std = np.sqrt((q_dist * (self.agent.support_np - q_values[:, None]) ** 2).sum(axis=1))
 
+        mode = SELECTION_MODE if selection_mode is None else selection_mode
+        if mode not in _VALID_SELECTION_MODES:
+            raise ValueError(f"selection_mode inválido: {mode!r}. Use um de {_VALID_SELECTION_MODES}.")
+        lam = MMR_LAMBDA if mmr_lambda is None else mmr_lambda
+        self.last_pool_idx = pool_idx.copy()
+
         pool_vectors = self.feature_space.item_features(pool_idx)
         positions, slot_types, propensities = self._select_slots(
-            adjusted, pool_vectors, k, deterministic=deterministic
+            adjusted, pool_vectors, k, deterministic=deterministic, mode=mode, mmr_lambda=lam
         )
 
         results = []
@@ -1151,7 +1263,8 @@ class Recommender:
                 "p_muito_ruim": float(q_dist[pos, 0]),   # P(nível 1 = muito ruim), usado no guardrail probabilístico
                 "score": float(adjusted[pos]),           # score híbrido pós-fadiga e pós-risco
                 "propensity": propensity,                # π(a|x) para avaliação off-policy
-                "slot_type": slot_type,                  # "greedy" | "explore" | "mmr"
+                "slot_type": slot_type,                  # "greedy" | "explore" | "mmr" | "greedy_fill"
+                "selection_mode": mode,                  # propensões só comparáveis dentro do mesmo modo
             })
             self.recommended_items.add(item_idx)
 
@@ -1249,14 +1362,34 @@ class Recommender:
         return base - risk_penalty
 
     def _select_slots(self, adjusted: np.ndarray, pool_vectors: np.ndarray, k: int,
-                       deterministic: bool = False):
+                       deterministic: bool = False, mode: str = "full",
+                       mmr_lambda: float = MMR_LAMBDA):
         """
+        mode (ver SELECTION_MODE): os três modos compartilham TODO o pipeline até
+        `adjusted` e diferem só aqui -- qualquer diferença medida entre eles é efeito
+        da seleção, e de nada mais.
+          "full"   -> slot 1 argmax + slot exploratório + MMR nos demais (atual).
+          "no_mmr" -> idem, com os demais slots preenchidos por guloso em `adjusted`
+                      (slot_type "greedy_fill"). Nem o MMR nem o guloso consomem
+                      números aleatórios: partindo do mesmo estado do gerador, "full"
+                      e "no_mmr" escolhem o MESMO slot 1 e o MESMO slot exploratório
+                      (e o mesmo embaralhamento de cauda) -- só os slots que o MMR
+                      decide podem diferir. Com mmr_lambda=1.0, o valor MMR vira
+                      exatamente `adjusted[c]` em ponto flutuante e "full" == "no_mmr"
+                      item a item.
+          "greedy" -> top-k determinístico por `adjusted` (desempate estável, menor
+                      índice primeiro -- o mesmo do np.argmax), sem exploração e sem
+                      consumir o gerador.
+
         deterministic=True: desliga o slot exploratório (e, por consequência, o
-        embaralhamento da cauda, que só roda quando há slot exploratório) -- só
-        restam o slot 1 (sempre argmax, já determinístico) e os slots MMR
-        (determinísticos condicionados às escolhas anteriores). Usado por
-        diagnósticos que precisam isolar sensibilidade ao estado do ruído do
-        softmax/sorteio de posição. Ver Recommender.recommend().
+        embaralhamento da cauda, que só roda quando há slot exploratório) em
+        qualquer modo -- só restam o slot 1 (sempre argmax, já determinístico) e os
+        slots MMR/guloso (determinísticos condicionados às escolhas anteriores).
+        Usado por diagnósticos que precisam isolar sensibilidade ao estado do ruído
+        do softmax/sorteio de posição (check_state_sensitivity). Mantido ortogonal a
+        `mode` -- NÃO é um atalho para mode="greedy": em "full" ele preserva o MMR nos
+        slots 2..k, e o sanity check [3] depende exatamente dessa semântica (trocá-la
+        mudaria a saída de --eval em relação a tests/golden/eval_single_seed.txt).
 
         Slot 1: SEMPRE o argmax determinístico de `adjusted` -- o item de maior score
         pós-fadiga/risco no pool atual, inclusive durante rodadas de exploração. Nunca
@@ -1288,6 +1421,11 @@ class Recommender:
         """
         n = len(adjusted)
         k = min(k, n)
+
+        if mode == "greedy":
+            order = np.argsort(-adjusted, kind="stable")[:k]
+            return [int(p) for p in order], ["greedy"] * len(order), [1.0] * len(order)
+
         remaining = list(range(n))
         chosen, slot_types, propensities = [], [], []
 
@@ -1310,18 +1448,25 @@ class Recommender:
             has_explore = True
 
         while len(chosen) < k and remaining:
-            best_pos, best_value = None, -np.inf
-            for candidate in remaining:
-                similarity = max(
-                    _cosine_similarity(pool_vectors[candidate], pool_vectors[s]) for s in chosen
-                )
-                value = MMR_LAMBDA * adjusted[candidate] - (1.0 - MMR_LAMBDA) * similarity
-                if value > best_value:
-                    best_pos, best_value = candidate, value
-            chosen.append(best_pos)
-            slot_types.append("mmr")
+            greedy_pos = remaining[int(np.argmax(adjusted[remaining]))]
+            if mode == "no_mmr":
+                pick, stype = greedy_pos, "greedy_fill"
+            else:
+                sims = [
+                    max(_cosine_similarity(pool_vectors[c], pool_vectors[s]) for s in chosen)
+                    for c in remaining
+                ]
+                best_pos, best_value = None, -np.inf
+                for candidate, similarity in zip(remaining, sims):
+                    value = mmr_lambda * adjusted[candidate] - (1.0 - mmr_lambda) * similarity
+                    if value > best_value:
+                        best_pos, best_value = candidate, value
+                pick, stype = best_pos, "mmr"
+                self._record_mmr_step(adjusted, remaining, sims, greedy_pos, pick)
+            chosen.append(pick)
+            slot_types.append(stype)
             propensities.append(1.0)
-            remaining.remove(best_pos)
+            remaining.remove(pick)
 
         # Embaralha só a CAUDA (posições 1..k-1) para esconder do usuário qual delas é
         # o slot exploratório -- o slot 1 (melhor item, greedy) NUNCA é movido: fica
@@ -1409,15 +1554,28 @@ def _holdout_bonus(octant: int, item: pd.Series) -> float:
     return b
 
 
-def _simulate(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> tuple[float, int]:
-    """Comportamento idêntico à versão pré-refatoração -- só reorganizado para usar
-    _p_execution/_alignment_score em vez de código inline (ver as duas acima)."""
+def _simulate(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn,
+              u_exec: float | None = None, z_noise: float | None = None) -> tuple[float, int]:
+    """Comportamento idêntico à versão pré-refatoração quando u_exec/z_noise são
+    None (só reorganizado para usar _p_execution/_alignment_score em vez de código
+    inline, ver as duas acima) -- inclusive a ordem de consumo do gerador global
+    (random.random() para execução, depois random.gauss para o ruído), verificada
+    pelo teste de linha de base (tests/golden/eval_single_seed.txt).
+
+    u_exec/z_noise: sorteios PRÉ-GERADOS opcionais (números aleatórios comuns --
+    ver multiseed.pregenerate_randomness), usados só pelo motor multi-seed para
+    que todos os braços de uma réplica vejam exatamente os mesmos sorteios de
+    execução/ruído -- só o item escolhido varia entre eles. u_exec substitui
+    random.random() (uniforme [0,1)); z_noise é normal(0,1) padrão, escalado aqui
+    pelo mesmo desvio (0.05) que random.gauss(0, 0.05) usaria."""
     p_execution = _p_execution(curr_oct, item)
-    if random.random() > p_execution:
+    u = random.random() if u_exec is None else float(u_exec)
+    if u > p_execution:
         return REWARD_SUPPORT[1], curr_oct   # equivalente a "ruim": não chegou a executar a intervenção
 
     score = _alignment_score(curr_oct, dest_oct, item, bonus_fn)
-    score_noisy = max(0.0, min(1.0, score + random.gauss(0, 0.05)))
+    noise = random.gauss(0, 0.05) if z_noise is None else 0.05 * float(z_noise)
+    score_noisy = max(0.0, min(1.0, score + noise))
     next_oct = dest_oct if score_noisy > 0.65 else curr_oct
 
     # Recompensa latente contínua em [-1, 1] (score=0 -> -1, score=0.5 -> 0, score=1 ->
@@ -1431,11 +1589,16 @@ def _simulate(curr_oct: int, dest_oct: int, item: pd.Series, bonus_fn) -> tuple[
     return reward, next_oct
 
 
-def simulate_feedback_holdout(curr_oct: int, dest_oct: int, item: pd.Series) -> tuple[float, int]:
+def simulate_feedback_holdout(curr_oct: int, dest_oct: int, item: pd.Series,
+                              u_exec: float | None = None,
+                              z_noise: float | None = None) -> tuple[float, int]:
     """
     Simula o feedback do usuário. Retorna (recompensa_continua, proximo_oitante).
     Uso exclusivo em avaliação (baselines/regret/heatmap) -- nunca para treinar o
     modelo de produção (ver docstring da seção acima).
+
+    u_exec/z_noise: repassados a _simulate -- ver docstring lá. None (padrão)
+    preserva o comportamento legado bit a bit.
 
     Bônus com dois perfis, escolhidos automaticamente pela presença da coluna
     `category` (só existe em itens do catálogo real -- data_source.
@@ -1457,7 +1620,7 @@ def simulate_feedback_holdout(curr_oct: int, dest_oct: int, item: pd.Series) -> 
     também pelo oráculo de regret (oracle_pick), que precisa ser fiel a este MESMO
     bônus, não a uma fórmula diferente.
     """
-    return _simulate(curr_oct, dest_oct, item, _holdout_bonus)
+    return _simulate(curr_oct, dest_oct, item, _holdout_bonus, u_exec=u_exec, z_noise=z_noise)
 
 
 # Avaliação offline - Bancada de teste
@@ -2090,6 +2253,9 @@ def _run_interaction(recommender: Recommender, agent: Agent, feature_space: Feat
         "reward": reward,
         "propensity": item["propensity"],
         "slot_type": item["slot_type"],
+        # Propensões dependem do modo de seleção: registros de modos diferentes não
+        # podem ser misturados numa avaliação off-policy sem saber de qual modo vieram.
+        "selection_mode": item["selection_mode"],
         "q_value": item["q_value"],
         "reward_std": item["reward_std"],
         "p_muito_ruim": item["p_muito_ruim"],
@@ -2120,6 +2286,8 @@ def main(dataset_path: str = None, carregar: str = None, salvar: str = CHECKPOIN
     recommender = Recommender(df, feature_space, agent)
     try:
         if interativo:
+            print(f"Modo de seleção dos slots: SELECTION_MODE={SELECTION_MODE!r} "
+                  f"(MMR_LAMBDA={MMR_LAMBDA})")
             _print_octant_map()
             while _run_interaction(recommender, agent, feature_space):
                 pass
@@ -2130,6 +2298,8 @@ def main(dataset_path: str = None, carregar: str = None, salvar: str = CHECKPOIN
             print(f"Interações com aprendizado: {agent.n_feedbacks}")
             print(f"Taxa de violação de segurança: {recommender.safety_violation_rate:.3f}")
             print(f"Cobertura do catálogo: {recommender.catalog_coverage:.3f}")
+            if SELECTION_MODE == "full":
+                print(f"Contador de inércia do MMR: {recommender.mmr_report()}")
 
     return recommender
 
@@ -2187,8 +2357,21 @@ def _run_offline_evaluation() -> None:
 
 if __name__ == "__main__":
     # python sistema_de_recomendacao_v3.py --eval roda a bancada de teste offline
-    # (simulador + baselines) em vez do loop interativo de produção.
-    if "--eval" in sys.argv:
-        _run_offline_evaluation()
+    # (simulador + baselines) em vez do loop interativo de produção. Com
+    # SEED_MODE="single" (padrão), é exatamente o caminho legado, intocado -- o
+    # motor multi-seed (multiseed.py) só entra quando SEED_MODE é "multi_fixed" ou
+    # "multi_random" (ver Parte 11 do plano de avaliação multi-seed: a linha de
+    # base precisa continuar reproduzível bit a bit).
+    if "--eval-selection" in sys.argv:
+        # Ablação da seleção de slots (full / no_mmr / greedy, varredura de lambda,
+        # métricas de lista) -- bancada separada, ver selection_ablation.py.
+        import selection_ablation
+        selection_ablation.run_selection_ablation()
+    elif "--eval" in sys.argv:
+        if SEED_MODE == "single":
+            _run_offline_evaluation()
+        else:
+            import multiseed
+            multiseed.run_multiseed_evaluation()
     else:
         main()

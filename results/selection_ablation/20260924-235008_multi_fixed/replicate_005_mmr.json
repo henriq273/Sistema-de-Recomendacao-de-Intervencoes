@@ -1,0 +1,150 @@
+{
+  "cold": {
+    "greedy": {
+      "mmr_steps": 0,
+      "inertia_rate": null,
+      "inert_by_homogeneous_pool": null,
+      "inert_by_lambda": null,
+      "mean_similarity_spread": null,
+      "mean_relevance_sacrificed_when_diverged": null,
+      "mean_similarity_reduced_when_diverged": null
+    },
+    "no_mmr": {
+      "mmr_steps": 0,
+      "inertia_rate": null,
+      "inert_by_homogeneous_pool": null,
+      "inert_by_lambda": null,
+      "mean_similarity_spread": null,
+      "mean_relevance_sacrificed_when_diverged": null,
+      "mean_similarity_reduced_when_diverged": null
+    },
+    "full@1": {
+      "mmr_steps": 308,
+      "inertia_rate": 1.0,
+      "inert_by_homogeneous_pool": 0.04220779220779221,
+      "inert_by_lambda": 0.9577922077922078,
+      "mean_similarity_spread": 0.5432091969754789,
+      "mean_relevance_sacrificed_when_diverged": null,
+      "mean_similarity_reduced_when_diverged": null
+    },
+    "full@0.9": {
+      "mmr_steps": 308,
+      "inertia_rate": 1.0,
+      "inert_by_homogeneous_pool": 0.04220779220779221,
+      "inert_by_lambda": 0.9577922077922078,
+      "mean_similarity_spread": 0.5432091969754789,
+      "mean_relevance_sacrificed_when_diverged": null,
+      "mean_similarity_reduced_when_diverged": null
+    },
+    "full@0.8": {
+      "mmr_steps": 308,
+      "inertia_rate": 0.8246753246753247,
+      "inert_by_homogeneous_pool": 0.04220779220779221,
+      "inert_by_lambda": 0.7824675324675324,
+      "mean_similarity_spread": 0.44928021675774027,
+      "mean_relevance_sacrificed_when_diverged": 0.09693654157497265,
+      "mean_similarity_reduced_when_diverged": 0.8270852466424307
+    },
+    "full@0.7": {
+      "mmr_steps": 308,
+      "inertia_rate": 0.8246753246753247,
+      "inert_by_homogeneous_pool": 0.04220779220779221,
+      "inert_by_lambda": 0.7824675324675324,
+      "mean_similarity_spread": 0.44928021675774027,
+      "mean_relevance_sacrificed_when_diverged": 0.09693654157497265,
+      "mean_similarity_reduced_when_diverged": 0.8270852466424307
+    },
+    "full@0.5": {
+      "mmr_steps": 308,
+      "inertia_rate": 0.6331168831168832,
+      "inert_by_homogeneous_pool": 0.04220779220779221,
+      "inert_by_lambda": 0.5909090909090909,
+      "mean_similarity_spread": 0.43246094500283144,
+      "mean_relevance_sacrificed_when_diverged": 0.15522587774074184,
+      "mean_similarity_reduced_when_diverged": 0.5291611126302618
+    },
+    "full@0.3": {
+      "mmr_steps": 308,
+      "inertia_rate": 0.36038961038961037,
+      "inert_by_homogeneous_pool": 0.04220779220779221,
+      "inert_by_lambda": 0.3181818181818182,
+      "mean_similarity_spread": 0.3589031515860712,
+      "mean_relevance_sacrificed_when_diverged": 0.4396605742764352,
+      "mean_similarity_reduced_when_diverged": 0.5595220496055439
+    }
+  },
+  "warm": {
+    "greedy": {
+      "mmr_steps": 0,
+      "inertia_rate": null,
+      "inert_by_homogeneous_pool": null,
+      "inert_by_lambda": null,
+      "mean_similarity_spread": null,
+      "mean_relevance_sacrificed_when_diverged": null,
+      "mean_similarity_reduced_when_diverged": null
+    },
+    "no_mmr": {
+      "mmr_steps": 0,
+      "inertia_rate": null,
+      "inert_by_homogeneous_pool": null,
+      "inert_by_lambda": null,
+      "mean_similarity_spread": null,
+      "mean_relevance_sacrificed_when_diverged": null,
+      "mean_similarity_reduced_when_diverged": null
+    },
+    "full@1": {
+      "mmr_steps": 297,
+      "inertia_rate": 1.0,
+      "inert_by_homogeneous_pool": 0.05723905723905724,
+      "inert_by_lambda": 0.9427609427609428,
+      "mean_similarity_spread": 0.3978306424838525,
+      "mean_relevance_sacrificed_when_diverged": null,
+      "mean_similarity_reduced_when_diverged": null
+    },
+    "full@0.9": {
+      "mmr_steps": 297,
+      "inertia_rate": 0.9730639730639731,
+      "inert_by_homogeneous_pool": 0.05723905723905724,
+      "inert_by_lambda": 0.9158249158249159,
+      "mean_similarity_spread": 0.3891361803819836,
+      "mean_relevance_sacrificed_when_diverged": 0.08201728016138077,
+      "mean_similarity_reduced_when_diverged": 0.7985567525029182
+    },
+    "full@0.8": {
+      "mmr_steps": 297,
+      "inertia_rate": 0.9730639730639731,
+      "inert_by_homogeneous_pool": 0.05723905723905724,
+      "inert_by_lambda": 0.9158249158249159,
+      "mean_similarity_spread": 0.3891361803819836,
+      "mean_relevance_sacrificed_when_diverged": 0.08201728016138077,
+      "mean_similarity_reduced_when_diverged": 0.7985567525029182
+    },
+    "full@0.7": {
+      "mmr_steps": 297,
+      "inertia_rate": 0.9494949494949495,
+      "inert_by_homogeneous_pool": 0.05723905723905724,
+      "inert_by_lambda": 0.8922558922558923,
+      "mean_similarity_spread": 0.3804417182801147,
+      "mean_relevance_sacrificed_when_diverged": 0.16399731636047363,
+      "mean_similarity_reduced_when_diverged": 0.7985567688941956
+    },
+    "full@0.5": {
+      "mmr_steps": 297,
+      "inertia_rate": 0.898989898989899,
+      "inert_by_homogeneous_pool": 0.05723905723905724,
+      "inert_by_lambda": 0.8417508417508418,
+      "mean_similarity_spread": 0.37938913286535025,
+      "mean_relevance_sacrificed_when_diverged": 0.252106644709905,
+      "mean_similarity_reduced_when_diverged": 0.6805018176635106
+    },
+    "full@0.3": {
+      "mmr_steps": 297,
+      "inertia_rate": 0.6464646464646464,
+      "inert_by_homogeneous_pool": 0.05723905723905724,
+      "inert_by_lambda": 0.5892255892255892,
+      "mean_similarity_spread": 0.2789645739376344,
+      "mean_relevance_sacrificed_when_diverged": 0.7513194856189546,
+      "mean_similarity_reduced_when_diverged": 0.7008145194678079
+    }
+  }
+}
