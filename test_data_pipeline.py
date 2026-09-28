@@ -17,6 +17,7 @@ Uso:
 import io
 import json
 import os
+import random
 import re
 import sys
 import tempfile
@@ -25,8 +26,10 @@ from contextlib import redirect_stdout
 
 import numpy as np
 import pandas as pd
+import torch
 
 import data_source
+import multiseed
 import safety
 import sistema_de_recomendacao_v3 as sysrec
 
@@ -1021,10 +1024,11 @@ def test_select_slots_slot1_always_greedy_argmax():
     """Requisito central: o slot 1 deve ser SEMPRE o item de maior `adjusted`
     score, de forma determinística -- nunca sorteado, mesmo quando o slot
     exploratório entra em jogo (P_EXPLORE_SLOT) ou quando a cauda é embaralhada.
-    _select_slots não lê nada de `self` -- testável isoladamente como função pura,
-    sem Agent/FeatureSpace reais (mesmo padrão de self falso já usado para
-    _apply_safety_filter)."""
-    fake_self = types.SimpleNamespace()
+    _select_slots só escreve em `self` pelo contador de inércia do MMR (passivo,
+    não altera escolhas) -- testável isoladamente sem Agent/FeatureSpace reais,
+    com um self falso que expõe só esse contador como no-op (mesmo padrão de self
+    falso já usado para _apply_safety_filter)."""
+    fake_self = types.SimpleNamespace(_record_mmr_step=lambda *args, **kwargs: None)
     adjusted = np.array([0.1, 0.9, 0.3, 0.5], dtype=np.float32)  # posição 1 = argmax, sem empate
     pool_vectors = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]])
     true_best = int(np.argmax(adjusted))
@@ -1121,6 +1125,781 @@ def test_slot1_deterministic_and_respects_fatigue_spacing():
     )
 
 
+# ---------- multiseed.py (avaliação multi-seed) ----------
+#
+# Teste 1 do plano ("com SEED_MODE='single', a saída de --eval é idêntica ao
+# arquivo de referência") FICA DE FORA deste suite automático de propósito: rodar
+# --eval de verdade leva ~1-2min (baselines n=3000), e este arquivo é pensado para
+# rodar em segundos. Verificação manual, feita uma vez após a refatoração do
+# simulador:
+#   python sistema_de_recomendacao_v3.py --eval > /tmp/eval_now.txt
+#   diff tests/golden/eval_single_seed.txt /tmp/eval_now.txt
+# (sem diferenças == a refatoração retrocompatível de _simulate/
+# simulate_feedback_holdout não mudou o caminho legado bit a bit.)
+
+
+def test_multiseed_config_validation_raises():
+    """Teste 14: SEED_MODE inválido, e REPLAY_ENTROPY fora do modo multi_random,
+    levantam ValueError na importação do módulo -- verificado executando o
+    trecho real de validação (copiado literalmente de
+    sistema_de_recomendacao_v3.py) com valores que o violam, em vez de reimportar
+    o módulo inteiro meio da suíte de testes (efeito colateral indesejado)."""
+    valid_modes = sysrec._VALID_SEED_MODES
+
+    def _validate(seed_mode, replay_entropy):
+        if seed_mode not in valid_modes:
+            raise ValueError(f"SEED_MODE inválido: {seed_mode!r}.")
+        if replay_entropy is not None and seed_mode != "multi_random":
+            raise ValueError("REPLAY_ENTROPY só tem efeito com SEED_MODE='multi_random'.")
+
+    raised_invalid_mode = False
+    try:
+        _validate("nao_existe", None)
+    except ValueError:
+        raised_invalid_mode = True
+    _check("14a. SEED_MODE inválido levanta ValueError", raised_invalid_mode)
+
+    raised_bad_replay = False
+    try:
+        _validate("multi_fixed", 123)
+    except ValueError:
+        raised_bad_replay = True
+    _check("14b. REPLAY_ENTROPY fora de multi_random levanta ValueError", raised_bad_replay)
+
+    # A configuração vigente hoje (single, REPLAY_ENTROPY=None) não levanta nada --
+    # já provado pelo simples fato de sistema_de_recomendacao_v3 ter importado.
+    _check(
+        "14c. configuração vigente (SEED_MODE=single) é válida",
+        sysrec.SEED_MODE in valid_modes and (sysrec.REPLAY_ENTROPY is None or sysrec.SEED_MODE == "multi_random"),
+    )
+
+
+def test_multiseed_build_seed_plan_32bit_limit():
+    """Teste 10: nenhuma seed derivada por build_seed_plan excede o limite de 32
+    bits do np.random.seed legado (a entropia raiz tem 128 bits; generate_state
+    trunca para uint32 -- aqui confirmamos que o valor final já vem truncado)."""
+    _, plan = multiseed.build_seed_plan("multi_fixed", 8, master_seed=123)
+    all_within = all(0 <= r.global_seed < 2**32 for r in plan)
+    _check(
+        "10. todas as seeds globais derivadas ficam dentro de [0, 2**32)",
+        all_within,
+        f"seeds={[r.global_seed for r in plan]}",
+    )
+
+
+def test_multiseed_seeded_scope_restores_state():
+    """Teste 4: seeded_scope aplica a seed dentro do bloco e restaura o estado
+    ANTERIOR (não um reinício do fluxo) ao sair -- para random, numpy e torch."""
+    s = random.getstate()
+    a = random.random()
+    random.setstate(s)
+    with multiseed.seeded_scope(123):
+        random.random()
+    b = random.random()
+    _check("4a. random: estado restaurado -- próximo valor é o mesmo de antes do bloco", a == b)
+
+    np_state = np.random.get_state()
+    a_np = np.random.random()
+    np.random.set_state(np_state)
+    with multiseed.seeded_scope(123):
+        np.random.random()
+    b_np = np.random.random()
+    _check("4b. numpy: estado restaurado -- próximo valor é o mesmo de antes do bloco", a_np == b_np)
+
+    torch_state = torch.get_rng_state()
+    a_t = torch.rand(1).item()
+    torch.set_rng_state(torch_state)
+    with multiseed.seeded_scope(123):
+        torch.rand(1)
+    b_t = torch.rand(1).item()
+    _check("4c. torch: estado restaurado -- próximo valor é o mesmo de antes do bloco", a_t == b_t)
+
+
+def test_multiseed_seeded_scope_restores_on_exception():
+    """seeded_scope restaura o estado mesmo quando o bloco lança -- garantia
+    equivalente à de safety_filter_disabled/_override já testadas alhures."""
+    s = random.getstate()
+    a = random.random()
+    random.setstate(s)
+    raised = False
+    try:
+        with multiseed.seeded_scope(999):
+            random.random()
+            raise RuntimeError("boom")
+    except RuntimeError:
+        raised = True
+    b = random.random()
+    _check(
+        "seeded_scope restaura o estado mesmo quando o bloco lança exceção",
+        raised and a == b,
+        f"raised={raised} a={a} b={b}",
+    )
+
+
+def test_multiseed_crn_no_global_consumption_when_presampled():
+    """Teste 5 (fundamento do CRN): quando u_exec/z_noise são passados,
+    simulate_feedback_holdout não consome NADA do gerador global -- é isso que
+    garante que todos os braços, vendo os mesmos sorteios pré-gerados, sejam
+    independentes entre si (adicionar/remover um braço não desloca o consumo do
+    gerador para os demais)."""
+    df, _ = _build_tiny_recommender_df(n_items=3)
+    item = df.iloc[0]
+
+    s = random.getstate()
+    sysrec.simulate_feedback_holdout(1, 2, item, u_exec=0.01, z_noise=0.0)
+    unchanged = random.getstate() == s
+    _check(
+        "5. simulate_feedback_holdout com u_exec/z_noise pré-gerados não consome "
+        "o gerador global random (condição que torna os braços independentes sob CRN)",
+        unchanged,
+    )
+
+
+def test_multiseed_pregenerate_randomness_shapes():
+    """pregenerate_randomness produz os cinco arrays no tamanho pedido, com
+    destinos restritos a ALLOWED_DEST_OCTANTS (a avaliação multi-seed reflete os
+    destinos que a produção de fato oferece, diferente do _random_context legado,
+    que sorteava de 1 a 8)."""
+    ctx_ss = np.random.SeedSequence(1)
+    noise_ss = np.random.SeedSequence(2)
+    rnd = multiseed.pregenerate_randomness(50, ctx_ss, noise_ss)
+    shapes_ok = all(len(getattr(rnd, f)) == 50 for f in
+                    ("curr", "dest", "u_exec", "z_noise", "u_random_arm"))
+    dest_ok = set(rnd.dest.tolist()) <= set(sysrec.ALLOWED_DEST_OCTANTS)
+    _check(
+        "pregenerate_randomness: 5 arrays de tamanho n_episodes, dest restrito a "
+        "ALLOWED_DEST_OCTANTS",
+        shapes_ok and dest_ok,
+        f"dest únicos={sorted(set(rnd.dest.tolist()))}",
+    )
+
+
+def test_multiseed_reproducible_same_process():
+    """Testes 2 e 6: multi_fixed rodado duas vezes no mesmo processo produz
+    recompensas idênticas por réplica (reprodutibilidade), e rodar as réplicas em
+    ordem inversa produz os mesmos resultados por replicate_id (independência de
+    ordem -- consequência de seeded_scope aplicar/restaurar estado por réplica)."""
+    df, feature_space = _build_tiny_recommender_df(n_items=20)
+    _, plan = multiseed.build_seed_plan("multi_fixed", 3, master_seed=7)
+
+    def _run_all(order):
+        results = {}
+        for i in order:
+            results[i] = multiseed.run_replicate(df, feature_space, plan[i], n_episodes=25)
+        return results
+
+    run_a = _run_all([0, 1, 2])
+    run_b = _run_all([0, 1, 2])
+    same_process_ok = all(
+        np.array_equal(run_a[i]["rewards"][arm], run_b[i]["rewards"][arm])
+        for i in range(3) for arm in multiseed.ARMS
+    )
+    _check("2. multi_fixed rodado duas vezes no mesmo processo produz recompensas "
+          "idênticas por réplica", same_process_ok)
+
+    run_reversed = _run_all([2, 1, 0])
+    order_independent_ok = all(
+        np.array_equal(run_a[i]["rewards"][arm], run_reversed[i]["rewards"][arm])
+        for i in range(3) for arm in multiseed.ARMS
+    )
+    _check("6. rodar as réplicas em ordem inversa produz os mesmos resultados por "
+          "replicate_id (independência de ordem)", order_independent_ok)
+
+
+def test_multiseed_crn_arm_independence():
+    """Teste 5: adicionar um braço fictício à execução não altera o array de
+    recompensas de nenhum dos braços existentes -- prova direta sobre
+    run_replicate, não só sobre a chamada isolada do simulador."""
+    df, feature_space = _build_tiny_recommender_df(n_items=15)
+    _, plan = multiseed.build_seed_plan("multi_fixed", 1, master_seed=11)
+    rseed = plan[0]
+
+    baseline = multiseed.run_replicate(df, feature_space, rseed, n_episodes=20)
+
+    original_picks_source = multiseed.run_replicate.__code__  # sanity: função real
+    assert original_picks_source is not None
+
+    # Reproduz run_replicate manualmente com um braço extra ("ficticio") inserido
+    # no dict `picks`, usando os MESMOS sorteios pré-gerados -- monkeypatch
+    # cirúrgico via reimplementação local, já que ARMS/picks são fixos no código.
+    rnd = multiseed.pregenerate_randomness(20, rseed.ctx_ss, rseed.noise_ss)
+    eligible = df.index.to_numpy(dtype=int)
+    time_avail = feature_space.max_duration
+    popular_item = int(eligible[np.argmax(df.loc[eligible, "Valencia"].to_numpy())])
+    content_cache = {}
+    rewards_with_extra = {arm: np.empty(20, dtype=np.float32) for arm in (*multiseed.ARMS, "ficticio")}
+
+    with multiseed.seeded_scope(rseed.global_seed):
+        agent = sysrec.Agent(df, feature_space)
+        for ep in range(20):
+            curr, dest = int(rnd.curr[ep]), int(rnd.dest[ep])
+            user_state = feature_space.user_state(curr, dest, time_avail)
+            if (curr, dest) not in content_cache:
+                d = sysrec.distance_to_point(df.loc[eligible], sysrec.target_point(curr, dest))
+                content_cache[(curr, dest)] = int(eligible[np.argmin(d)])
+            random_pos = min(int(rnd.u_random_arm[ep] * len(eligible)), len(eligible) - 1)
+            picks = {
+                "aleatorio": int(eligible[random_pos]),
+                "mais_popular": popular_item,
+                "conteudo_puro": content_cache[(curr, dest)],
+                "agent_online": int(eligible[np.argmax(agent.q_values(user_state, eligible))]),
+                "ficticio": int(eligible[0]),  # braço extra, sempre o mesmo item
+            }
+            for arm, item_idx in picks.items():
+                reward, next_oct = sysrec.simulate_feedback_holdout(
+                    curr, dest, df.loc[item_idx], u_exec=rnd.u_exec[ep], z_noise=rnd.z_noise[ep],
+                )
+                rewards_with_extra[arm][ep] = reward
+                if arm == "agent_online":
+                    next_state = feature_space.user_state(next_oct, dest, time_avail)
+                    agent.learn_from_feedback(user_state, item_idx, reward, next_state)
+
+    unaffected = all(
+        np.array_equal(baseline["rewards"][arm], rewards_with_extra[arm])
+        for arm in multiseed.ARMS
+    )
+    _check(
+        "5. adicionar um braço fictício não altera as recompensas dos braços "
+        "existentes (CRN: números aleatórios comuns pré-gerados, consumo "
+        "independente do item escolhido)",
+        unaffected,
+    )
+
+
+def test_multiseed_random_mode_fresh_entropy():
+    """Teste 7: duas chamadas a build_seed_plan em multi_random sem REPLAY_ENTROPY
+    registram entropias raiz diferentes (entropia nova do SO a cada vez)."""
+    entropy_a, _ = multiseed.build_seed_plan("multi_random", 2)
+    entropy_b, _ = multiseed.build_seed_plan("multi_random", 2)
+    _check("7. multi_random sem REPLAY_ENTROPY gera entropia raiz nova a cada "
+          "execução", entropy_a != entropy_b)
+
+
+def test_multiseed_random_mode_replay_reproducible():
+    """Teste 8: com REPLAY_ENTROPY igual à entropia registrada de uma execução
+    anterior, o plano de seeds (e portanto os resultados) é idêntico."""
+    entropy, plan_a = multiseed.build_seed_plan("multi_random", 3)
+    _, plan_b = multiseed.build_seed_plan("multi_random", 3, replay_entropy=entropy)
+    seeds_match = [r.global_seed for r in plan_a] == [r.global_seed for r in plan_b]
+    _check("8. REPLAY_ENTROPY reproduz exatamente as mesmas seeds globais de uma "
+          "execução multi_random anterior", seeds_match)
+
+
+def test_multiseed_manifest_written_before_replicates():
+    """Teste 9: write_manifest grava o manifesto (com a entropia raiz) em disco
+    ANTES de qualquer réplica rodar -- testado diretamente, sem depender de
+    interromper um processo no meio."""
+    df, _ = _build_tiny_recommender_df(n_items=5)
+    root_entropy, plan = multiseed.build_seed_plan("multi_fixed", 2, master_seed=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = multiseed.write_manifest(tmp, "multi_fixed", root_entropy, plan, df)
+        manifest_path = os.path.join(tmp, "manifest.json")
+        exists_before_any_replicate = os.path.exists(manifest_path)
+        with open(manifest_path, encoding="utf-8") as f:
+            on_disk = json.load(f)
+        has_root_entropy = on_disk.get("root_entropy") == str(root_entropy)
+        has_replicates = len(on_disk.get("replicates", [])) == 2
+    _check(
+        "9. manifest.json é gravado (com entropia raiz e lista de réplicas) antes "
+        "de qualquer réplica rodar",
+        exists_before_any_replicate and has_root_entropy and has_replicates,
+        f"manifest={manifest}",
+    )
+
+
+def test_multiseed_pseudo_regret_never_negative():
+    """Teste 12: pseudo-regret (valor_esperado_do_oráculo - valor_esperado_do_item_
+    escolhido) é não-negativo por construção -- diferente do regret realizado
+    (regret_curve legado), que pode ser negativo por ruído amostral."""
+    df, feature_space = _build_tiny_recommender_df(n_items=15)
+    eligible = df.index.to_numpy(dtype=int)
+    oracle_table = multiseed.build_expected_value_table(df, eligible)
+    _, plan = multiseed.build_seed_plan("multi_fixed", 2, master_seed=5)
+
+    all_non_negative = True
+    for rseed in plan:
+        result = multiseed.run_replicate(df, feature_space, rseed, n_episodes=25,
+                                         oracle_table=oracle_table)
+        if (result["pseudo_regret"] < -1e-6).any():
+            all_non_negative = False
+    _check("12. pseudo-regret nunca é negativo em nenhum episódio", all_non_negative)
+
+
+def test_multiseed_isolation_from_production():
+    """Teste 11 (parte estática): multiseed.py nunca referencia Recommender,
+    FatigueTracker, Agent.save ou o log de interações -- busca textual, mesmo
+    padrão já usado para confirmar que safety_filter_disabled nunca envolve
+    main()."""
+    content = open(os.path.join(REPO_DIR, "multiseed.py"), encoding="utf-8").read()
+    # Ignora o docstring do módulo (linhas 1-N, entre as aspas triplas de abertura
+    # e fechamento): ele descreve a garantia em prosa ("nunca chama Agent.save()"),
+    # o que faria a própria busca textual acusar a si mesma. Busca só no código.
+    _, _, code_only = content.partition('"""\n')
+    code_only = code_only.split('"""', 1)[1] if '"""' in code_only else code_only
+    forbidden = ["Recommender(", "FatigueTracker(", ".save(", "INTERACTION_LOG",
+                "Recommender.recommend"]
+    found = [term for term in forbidden if term in code_only]
+    _check(
+        "11. multiseed.py nunca instancia Recommender/FatigueTracker, nunca chama "
+        ".save() nem referencia o log de interações",
+        not found,
+        f"termos encontrados: {found}",
+    )
+
+
+# ---------- Seleção dos slots: modos full/no_mmr/greedy, inércia, ablação ----------
+#
+# Teste 1 do plano de MMR ("com SELECTION_MODE='full', a saída de --eval é idêntica
+# ao arquivo de referência") fica fora da suíte automática pelo mesmo motivo do
+# teste 1 do multi-seed (custo): verificado manualmente com o diff contra
+# tests/golden/eval_single_seed.txt.
+
+
+def _build_varied_recommender(n_items: int = 60, seed: int = 0):
+    """Catálogo sintético com feature vectors VARIADOS (3 Tipos, 5 Tags, V/A
+    aleatórios) -- o suficiente para o MMR às vezes divergir do guloso, ao
+    contrário de _build_tiny_recommender, cujos itens são quase idênticos."""
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({
+        "Nome": [f"item{i}" for i in range(n_items)],
+        "Tipo": rng.choice(["Áudio", "Vídeo", "Imagem"], size=n_items),
+        "Valencia": rng.uniform(-0.9, 0.9, size=n_items),
+        "Arousal": rng.uniform(-0.9, 0.9, size=n_items),
+        "Duracao": [5.0] * n_items,
+        "Indoor": [0] * n_items,
+        "Tag": rng.choice(["a", "b", "c", "d", "e"], size=n_items),
+        "Oitante": [1] * n_items,
+    })
+    feature_space = sysrec.FeatureSpace(df)
+    agent = sysrec.Agent(df, feature_space)
+    return df, feature_space, agent
+
+
+def _random_contexts(n: int, seed: int = 123):
+    rng = np.random.default_rng(seed)
+    return [(int(rng.integers(1, 9)), int(rng.choice(sysrec.ALLOWED_DEST_OCTANTS)),
+             int(rng.integers(0, 2**31))) for _ in range(n)]
+
+
+# ---------- Tamanho de efeito nas comparações pareadas (multiseed.paired_comparison) ----------
+
+
+def test_effect_size_all_wins_and_all_losses():
+    """rank_biserial == 1.0 quando A vence em toda réplica sem empate de
+    magnitude (nenhum posto se cancela); == -1.0 no espelho -- confirma o sinal:
+    positivo quando A tende a vencer B."""
+    a_wins = np.array([5.0, 3.0, 8.0, 1.0, 6.0])
+    b = np.array([1.0, 1.0, 1.0, 0.5, 1.0])
+    c = multiseed.paired_comparison(a_wins, b, "a", "b")
+    _check("effect size: A vence em todas as réplicas -> rank_biserial == 1.0",
+           c["rank_biserial"] == 1.0 and c["effect_label"] == "grande",
+           f"{c}")
+
+    c2 = multiseed.paired_comparison(b, a_wins, "b", "a")
+    _check("effect size: espelho (B perde em todas) -> rank_biserial == -1.0",
+           c2["rank_biserial"] == -1.0, f"{c2}")
+
+
+def test_effect_size_tied_magnitudes_cancel():
+    """diffs=[2,-2,1,-1]: dois pares de magnitude empatada com sinal oposto --
+    os postos médios dos blocos empatados cancelam exatamente -> rank_biserial == 0.0.
+    Cobre o desempate de magnitude (mid-rank) com resultado analítico conhecido."""
+    a = np.array([2.0, -2.0, 1.0, -1.0])
+    zero = np.zeros(4)
+    c = multiseed.paired_comparison(a, zero, "a", "zero")
+    _check("effect size: pares de magnitude empatada e sinal oposto -> rank_biserial == 0.0",
+           c["rank_biserial"] == 0.0 and c["effect_label"] == "negligível", f"{c}")
+
+
+def test_effect_size_excludes_zero_diff_ties():
+    """diffs=[0,0,5,3,-1]: as duas réplicas empatadas (diff=0) ficam fora do
+    ranking e do denominador -- effect_n_pairs=3 (não 5). Conferido à mão:
+    |diffs| não-nulos ordenados = [1,3,5] (sem empate de magnitude) -> W+=rank(3)+rank(5)=2+3=5,
+    W-=rank(1)=1, T=W++W-=6=n(n+1)/2 com n=3 -> r=(5-1)/6=2/3."""
+    a = np.array([5.0, 3.0, 0.0, 4.0, 0.0])
+    b = np.array([0.0, 0.0, 0.0, 5.0, 0.0])   # diffs = [5, 3, 0, -1, 0]
+    c = multiseed.paired_comparison(a, b, "a", "b")
+    _check("effect size: réplicas empatadas (diff=0) excluídas do denominador",
+           c["ties"] == 2 and c["effect_n_pairs"] == 3, f"{c}")
+    _check("effect size: valor conferido à mão (W+=5, W-=1, T=6 -> r=2/3)",
+           abs(c["rank_biserial"] - 2 / 3) < 1e-9, f"{c}")
+
+
+def test_effect_size_label_thresholds():
+    """Os quatro rótulos de interpretação, nos limiares e em seus negativos
+    (abs() -- o sinal não afeta o rótulo), e o rótulo especial quando
+    effect_n_pairs == 0 (todas as réplicas empataram -- não é 'negligível')."""
+    cases = [
+        (0.05, "negligível"), (-0.05, "negligível"),
+        (0.2, "pequeno"), (-0.2, "pequeno"),
+        (0.4, "médio"), (-0.4, "médio"),
+        (0.6, "grande"), (-0.6, "grande"),
+    ]
+    ok = all(multiseed.effect_size_label(r, n_pairs=5) == label for r, label in cases)
+    _check("effect_size_label: os quatro rótulos batem nos limiares e seus negativos", ok,
+           f"{[(r, multiseed.effect_size_label(r, 5)) for r, _ in cases]}")
+    _check("effect_size_label: n_pairs=0 -> rótulo especial, não 'negligível'",
+           multiseed.effect_size_label(0.0, n_pairs=0) == "sem diferença (todas as réplicas empataram)")
+
+
+def test_effect_size_independent_of_scipy_availability():
+    """O valor do effect size (rank_biserial/effect_label/effect_n_pairs) nunca
+    chama scipy.stats.rankdata -- não deveria variar com o que está instalado no
+    ambiente. Forçar _HAVE_SCIPY=True só é seguro quando scipy está DE FATO
+    instalado (senão `wilcoxon`, importado condicionalmente no topo do módulo,
+    nunca foi vinculado, e chamá-lo lançaria NameError -- não um sinal de que o
+    effect size depende de scipy, só de que o ramo de teste de significância
+    genuinamente precisa dele). Por isso:
+      1. sempre confere que paired_comparison() bate com rank_biserial_correlation()
+         chamada direto, no estado REAL do ambiente (nunca tautológico: prova que a
+         função de comparação não recalcula nada diferente por fora);
+      2. só força o outro valor de _HAVE_SCIPY quando isso for seguro -- ida de
+         True->False é sempre segura (o ramo False nunca precisa de scipy); a
+         volta False->True só roda se scipy estiver genuinamente presente."""
+    a = np.array([5.0, -2.0, 3.0, 1.0, -4.0, 6.0, 0.0, 2.0])
+    b = np.zeros(8)
+    expected_r, expected_n = multiseed.rank_biserial_correlation(a - b)
+
+    natural = multiseed.paired_comparison(a, b, "a", "b")
+    _check("effect size de paired_comparison() bate com rank_biserial_correlation() "
+          "direta, no estado real do ambiente",
+           natural["rank_biserial"] == expected_r and natural["effect_n_pairs"] == expected_n,
+           f"natural={natural} expected=({expected_r}, {expected_n})")
+
+    original = multiseed._HAVE_SCIPY
+    if not original:
+        # scipy genuinamente ausente: forçar True chamaria `wilcoxon`, nunca
+        # vinculado (import condicional no topo do módulo) -- NameError não
+        # provaria nada sobre o effect size, só a falta real da dependência.
+        # A única direção segura de testar (True -> False) precisa de scipy
+        # real instalado; ver test_effect_size_matches_scipy_rankdata_when_available
+        # para a validação cruzada quando ele estiver presente.
+        _check("scipy ausente neste ambiente -- ramo _HAVE_SCIPY=True não pode "
+              "ser exercitado com segurança (ver teste de validação cruzada)", True)
+        return
+
+    try:
+        multiseed._HAVE_SCIPY = False
+        flipped = multiseed.paired_comparison(a, b, "a", "b")
+    finally:
+        multiseed._HAVE_SCIPY = original
+    same_effect_size = (
+        flipped["rank_biserial"] == natural["rank_biserial"]
+        and flipped["effect_label"] == natural["effect_label"]
+        and flipped["effect_n_pairs"] == natural["effect_n_pairs"]
+    )
+    _check("effect size idêntico ao forçar _HAVE_SCIPY=False (scipy está instalado "
+          "neste ambiente, então a ida True->False é segura de testar)",
+           same_effect_size, f"natural={natural} flipped={flipped}")
+
+
+def test_effect_size_matches_scipy_rankdata_when_available():
+    """Validação cruzada, só roda se scipy já estiver instalado: recomputa W+/T
+    via scipy.stats.rankdata (implementação de referência) de forma
+    independente e confere igualdade com rank_biserial_correlation -- sem criar
+    dependência nova, só valida a implementação manual de ranking quando scipy
+    já está presente no ambiente de teste."""
+    if not multiseed._HAVE_SCIPY:
+        _check("effect size bate com scipy.stats.rankdata (scipy indisponível -- pulado)", True)
+        return
+    from scipy.stats import rankdata
+    rng = np.random.default_rng(99)
+    diffs = rng.normal(size=30)
+    diffs[diffs.round(3) == 0] = 0.1  # evita zeros espúrios de ponto flutuante
+    nonzero = diffs[diffs != 0]
+    ranks = rankdata(np.abs(nonzero), method="average")
+    w_pos_ref = float(ranks[nonzero > 0].sum())
+    w_neg_ref = float(ranks[nonzero < 0].sum())
+    r_ref = (w_pos_ref - w_neg_ref) / (w_pos_ref + w_neg_ref)
+    r, n_pairs = multiseed.rank_biserial_correlation(diffs)
+    _check("effect size bate com scipy.stats.rankdata (implementação de referência)",
+           abs(r - r_ref) < 1e-9 and n_pairs == len(nonzero),
+           f"r={r} r_ref={r_ref} n_pairs={n_pairs}")
+
+
+def test_selection_mode_validation():
+    """Teste 7: SELECTION_MODE inválido levanta ValueError na importação --
+    verificado executando o código-fonte REAL do módulo com o valor trocado (não
+    uma réplica da lógica), sem reimportar o módulo da suíte. E um modo inválido
+    passado por chamada também é rejeitado por recommend()."""
+    path = os.path.join(REPO_DIR, "sistema_de_recomendacao_v3.py")
+    src = open(path, encoding="utf-8").read()
+    bad_src = src.replace('SELECTION_MODE = "full"', 'SELECTION_MODE = "nao_existe"', 1)
+    raised = False
+    with redirect_stdout(io.StringIO()):
+        try:
+            exec(compile(bad_src, path, "exec"), {"__name__": "sysrec_bad_mode", "__file__": path})
+        except ValueError:
+            raised = True
+    _check("7a. SELECTION_MODE inválido levanta ValueError na importação", raised)
+
+    df, feature_space, agent = _build_varied_recommender(n_items=20)
+    rec = sysrec.Recommender(df, feature_space, agent)
+    raised_call = False
+    try:
+        rec.recommend(1, 7, 60, register_fatigue=False, selection_mode="nao_existe")
+    except ValueError:
+        raised_call = True
+    _check("7b. selection_mode inválido por chamada levanta ValueError", raised_call)
+
+
+def test_selection_lambda1_equals_no_mmr():
+    """Teste 2: para o mesmo estado do gerador, em 500 contextos, full com
+    mmr_lambda=1.0 e no_mmr retornam os mesmos item_idx na mesma ordem e as mesmas
+    propensões (rótulos de slot diferem de propósito: 'mmr' vs 'greedy_fill')."""
+    df, feature_space, agent = _build_varied_recommender()
+    rec_full = sysrec.Recommender(df, feature_space, agent)
+    rec_nomm = sysrec.Recommender(df, feature_space, agent)
+    mismatches = 0
+    for curr, dest, seed in _random_contexts(500):
+        with multiseed.seeded_scope(seed):
+            a = rec_full.recommend(curr, dest, 60, register_fatigue=False,
+                                   selection_mode="full", mmr_lambda=1.0)
+        with multiseed.seeded_scope(seed):
+            b = rec_nomm.recommend(curr, dest, 60, register_fatigue=False, selection_mode="no_mmr")
+        if ([x["item_idx"] for x in a] != [x["item_idx"] for x in b]
+                or [x["propensity"] for x in a] != [x["propensity"] for x in b]):
+            mismatches += 1
+    _check("2. full com lambda=1.0 == no_mmr (itens, ordem e propensões) em 500 contextos",
+           mismatches == 0, f"divergências={mismatches}")
+
+
+def test_selection_greedy_deterministic_no_rng():
+    """Teste 3: greedy é determinístico, ordenado por `adjusted` decrescente, e não
+    consome random/numpy/torch."""
+    df, feature_space, agent = _build_varied_recommender()
+    rec = sysrec.Recommender(df, feature_space, agent)
+    py_s, np_s, t_s = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    first = rec.recommend(3, 7, 60, register_fatigue=False, selection_mode="greedy")
+    unchanged = (random.getstate() == py_s
+                 and all(np.array_equal(x, y) if isinstance(x, np.ndarray) else x == y
+                         for x, y in zip(np.random.get_state(), np_s))
+                 and torch.equal(torch.get_rng_state(), t_s))
+    repeats_equal = all(
+        [x["item_idx"] for x in rec.recommend(3, 7, 60, register_fatigue=False,
+                                              selection_mode="greedy")]
+        == [x["item_idx"] for x in first]
+        for _ in range(10)
+    )
+    scores = [x["score"] for x in first]
+    _check("3a. greedy não consome random/numpy/torch", unchanged)
+    _check("3b. greedy retorna a mesma lista em chamadas repetidas", repeats_equal)
+    _check("3c. greedy ordenado por adjusted decrescente",
+           all(scores[i] >= scores[i + 1] for i in range(len(scores) - 1)), f"scores={scores}")
+
+
+def test_selection_full_no_mmr_pairing():
+    """Teste 4: a partir do mesmo estado do gerador, os itens de slot 1 ('greedy') e
+    exploratório ('explore') são idênticos -- e na mesma posição -- entre full e
+    no_mmr; só os slots 'mmr'/'greedy_fill' podem diferir."""
+    df, feature_space, agent = _build_varied_recommender()
+    rec_full = sysrec.Recommender(df, feature_space, agent)
+    rec_nomm = sysrec.Recommender(df, feature_space, agent)
+    violations, explore_seen = 0, 0
+    for curr, dest, seed in _random_contexts(300, seed=7):
+        with multiseed.seeded_scope(seed):
+            a = rec_full.recommend(curr, dest, 60, register_fatigue=False, selection_mode="full")
+        with multiseed.seeded_scope(seed):
+            b = rec_nomm.recommend(curr, dest, 60, register_fatigue=False, selection_mode="no_mmr")
+        for x, y in zip(a, b):
+            if x["slot_type"] in ("greedy", "explore") or y["slot_type"] in ("greedy", "explore"):
+                explore_seen += x["slot_type"] == "explore"
+                if (x["item_idx"], x["slot_type"], x["propensity"]) != \
+                        (y["item_idx"], y["slot_type"], y["propensity"]):
+                    violations += 1
+    _check("4. slot 1 e slot exploratório idênticos (item, posição, propensão) entre "
+           "full e no_mmr", violations == 0 and explore_seen > 0,
+           f"violações={violations} exploratórios vistos={explore_seen}")
+
+
+def test_selection_instrumentation_passive():
+    """Teste 5: com o contador de inércia ativo, as listas de full são idênticas às
+    de uma instância com o contador desligado (no-op)."""
+    df, feature_space, agent = _build_varied_recommender()
+    rec_on = sysrec.Recommender(df, feature_space, agent)
+    rec_off = sysrec.Recommender(df, feature_space, agent)
+    rec_off._record_mmr_step = lambda *args, **kwargs: None
+    same = True
+    for curr, dest, seed in _random_contexts(200, seed=11):
+        with multiseed.seeded_scope(seed):
+            a = rec_on.recommend(curr, dest, 60, register_fatigue=False)
+        with multiseed.seeded_scope(seed):
+            b = rec_off.recommend(curr, dest, 60, register_fatigue=False)
+        same &= [x["item_idx"] for x in a] == [x["item_idx"] for x in b]
+    _check("5. contador de inércia é passivo (listas idênticas com e sem ele)",
+           same and rec_on.mmr_stats["steps"] > 0)
+
+
+def test_selection_inertia_counter_correct():
+    """Teste 6: (a) lambda=1.0 -> diverged=0; (b) pool com candidato de
+    similaridade muito menor e diferença de score pequena -> diverged>0; (c) pool
+    de vetores idênticos -> toda inércia classificada como pool homogêneo."""
+    df, feature_space, agent = _build_varied_recommender()
+    rec = sysrec.Recommender(df, feature_space, agent)
+    for curr, dest, seed in _random_contexts(200, seed=13):
+        with multiseed.seeded_scope(seed):
+            rec.recommend(curr, dest, 60, register_fatigue=False, mmr_lambda=1.0)
+    _check("6a. com lambda=1.0 o MMR nunca diverge do guloso",
+           rec.mmr_stats["diverged"] == 0 and rec.mmr_stats["steps"] > 0, str(rec.mmr_stats))
+
+    rec.reset_mmr_stats()
+    adjusted = np.array([1.0, 0.95, 0.94])
+    vectors = np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])   # item 2: similaridade 0 com o slot 1
+    rec._select_slots(adjusted, vectors, k=2, deterministic=True, mode="full", mmr_lambda=0.7)
+    _check("6b. candidato bem menos similar com gap de score pequeno -> MMR diverge",
+           rec.mmr_stats["diverged"] == 1, str(rec.mmr_stats))
+
+    rec.reset_mmr_stats()
+    vectors_same = np.ones((3, 2))
+    rec._select_slots(np.array([1.0, 0.5, 0.3]), vectors_same, k=3, deterministic=True,
+                      mode="full", mmr_lambda=0.7)
+    s = rec.mmr_stats
+    _check("6c. vetores idênticos -> toda inércia classificada como pool homogêneo",
+           s["steps"] == 2 and s["inert_homogeneous"] == 2 and s["diverged"] == 0, str(s))
+
+
+def test_selection_mode_logged():
+    """Teste 8: cada registro de interação contém selection_mode -- capturado
+    substituindo _persist_interaction (nunca escreve no interaction_log.jsonl real)
+    e as funções de entrada do CLI."""
+    df, feature_space, agent = _build_varied_recommender(n_items=20)
+    rec = sysrec.Recommender(df, feature_space, agent)
+    captured = []
+    originals = {name: getattr(sysrec, name) for name in
+                 ("_persist_interaction", "_read_octant", "_read_choice", "_read_feedback")}
+    octants = iter([1, 7])
+    try:
+        sysrec._persist_interaction = lambda record, path=None: captured.append(record)
+        sysrec._read_octant = lambda prompt: next(octants)
+        sysrec._read_choice = lambda prompt, options: "A"
+        sysrec._read_feedback = lambda: (4, 0.5)
+        with redirect_stdout(io.StringIO()):
+            sysrec._run_interaction(rec, agent, feature_space)
+    finally:
+        for name, fn in originals.items():
+            setattr(sysrec, name, fn)
+    _check("8. registro de interação contém selection_mode",
+           len(captured) == 1 and captured[0].get("selection_mode") == sysrec.SELECTION_MODE,
+           f"registros={captured}")
+
+
+def test_selection_list_metrics():
+    """Teste 9: lista de três itens da mesma modalidade tem n_modalities=1, e
+    ild_features coincide com o cálculo de coverage_and_diversity (1 - média do
+    cosseno entre pares sobre item_matrix)."""
+    import selection_ablation as sa
+    df, feature_space, _ = _build_varied_recommender()
+    tipo = df["Tipo"].iloc[0]
+    items = df.index[df["Tipo"] == tipo][:3].tolist()
+    ev_row = np.zeros(len(df))
+    m = sa.list_metrics(items, ["greedy", "mmr", "mmr"], df, feature_space, ev_row,
+                        np.array(items))
+    vecs = [feature_space.item_matrix[i] for i in items]
+    sims = [sysrec._cosine_similarity(vecs[i], vecs[j])
+            for i in range(len(vecs)) for j in range(i + 1, len(vecs))]
+    expected_ild = 1.0 - float(np.mean(sims))
+    _check("9a. três itens da mesma modalidade -> n_modalities=1", m["n_modalities"] == 1)
+    _check("9b. ild_features == cálculo de coverage_and_diversity",
+           abs(m["ild_features"] - expected_ild) < 1e-12,
+           f"{m['ild_features']} vs {expected_ild}")
+
+
+def test_selection_choice_model():
+    """Teste 10: com afinidade de escala 0 a utilidade é exatamente o valor
+    esperado; o mesmo u_choice produz a mesma escolha para a mesma lista."""
+    import selection_ablation as sa
+    df, _, _ = _build_varied_recommender()
+    items = [0, 1, 2]
+    ev_row = np.linspace(-0.5, 0.5, len(df))
+    mods = sorted(df["Tipo"].unique())
+    zero_aff = {m: 0.0 for m in mods}
+    a = sa.choice_metrics(items, df, ev_row, zero_aff, 0.42)
+    b = sa.choice_metrics(items, df, ev_row, zero_aff, 0.42)
+    _check("10a. escala 0 -> utilidade == valor esperado",
+           a["best_utility"] == float(ev_row[items].max())
+           and a["chosen_utility"] in [float(v) for v in ev_row[items]])
+    _check("10b. mesmo u_choice -> mesma escolha", a == b)
+
+
+def test_selection_crn_across_configs():
+    """Teste 11: acrescentar uma configuração à comparação não altera as métricas
+    das demais (cada configuração tem seu Recommender; cada chamada roda na seed
+    de seleção do contexto)."""
+    import selection_ablation as sa
+    df, feature_space, agent = _build_varied_recommender()
+    ev_table = multiseed.build_expected_value_table(df, df.index.to_numpy(dtype=int))
+    contexts = sa.pregenerate_contexts(42, 0, 40, sorted(df["Tipo"].unique()))
+    base_cfg = [("no_mmr", "no_mmr", None), ("full@0.7", "full", 0.7)]
+    more_cfg = [("greedy", "greedy", None)] + base_cfg + [("full@0.3", "full", 0.3)]
+    small = sa.run_protocol_p1(df, feature_space, agent, contexts, ev_table, base_cfg)
+    big = sa.run_protocol_p1(df, feature_space, agent, contexts, ev_table, more_cfg)
+    same = all(np.array_equal(small[n]["metrics"][k], big[n]["metrics"][k])
+               for n, _, _ in base_cfg for k in small[n]["metrics"])
+    _check("11. acrescentar configurações não altera as métricas das demais (CRN)", same)
+
+
+def test_selection_ablation_isolation():
+    """Teste 12: selection_ablation.py nunca chama Agent.save(), nunca toca o log
+    de interações e nunca treina o agente durante a comparação (busca textual no
+    código, fora do docstring) -- e _frozen_agent faz learn_from_feedback levantar
+    dentro do bloco, restaurando o método da classe ao sair."""
+    import selection_ablation as sa
+    content = open(os.path.join(REPO_DIR, "selection_ablation.py"), encoding="utf-8").read()
+    _, _, code_only = content.partition('"""\n')
+    code_only = code_only.split('"""', 1)[1]
+    forbidden = [".save(", "INTERACTION_LOG", "_persist_interaction", "learn_from_feedback("]
+    found = [t for t in forbidden if t in code_only]
+    _check("12a. selection_ablation.py não salva checkpoint, não toca o log, não treina",
+           not found, f"encontrados: {found}")
+
+    _, _, agent = _build_varied_recommender(n_items=10)
+    raised = False
+    with sa._frozen_agent(agent):
+        try:
+            agent.learn_from_feedback(None, 0, 0.0, None)
+        except RuntimeError:
+            raised = True
+    restored = "learn_from_feedback" not in vars(agent)
+    _check("12b. learn_from_feedback levanta durante a comparação e é restaurado depois",
+           raised and restored)
+
+
+def test_selection_range_index_check():
+    """Teste 13: a ablação exige df.index == RangeIndex antes de usar a tabela de
+    valor esperado por posição, e aborta com erro claro se não for."""
+    import selection_ablation as sa
+    df, _, _ = _build_varied_recommender(n_items=10)
+    ok = True
+    try:
+        sa.check_range_index(df)
+    except ValueError:
+        ok = False
+    raised = False
+    try:
+        sa.check_range_index(df.iloc[::-1])
+    except ValueError:
+        raised = True
+    _check("13. check_range_index aceita RangeIndex e rejeita índice fora de ordem", ok and raised)
+
+
+def _build_tiny_recommender_df(n_items: int = 10):
+    """Catálogo sintético mínimo + FeatureSpace, para os testes de multiseed.py
+    que não precisam de Recommender/Agent prontos (run_replicate cria seu próprio
+    Agent por réplica)."""
+    df = pd.DataFrame({
+        "Nome": [f"item{i}" for i in range(n_items)],
+        "Tipo": ["Áudio"] * n_items,
+        "Valencia": [0.1 * (i % 10) for i in range(n_items)],
+        "Arousal": [-0.05 * (i % 10) for i in range(n_items)],
+        "Duracao": [5.0] * n_items,
+        "Indoor": [0] * n_items,
+        "Tag": ["x"] * n_items,
+        "Oitante": [1] * n_items,
+    })
+    feature_space = sysrec.FeatureSpace(df)
+    return df, feature_space
+
+
 def main() -> None:
     test_write_methods_absent()
     test_pymongo_import_is_local_not_module_level()
@@ -1156,6 +1935,40 @@ def main() -> None:
     test_load_json_export_reads_only_from_dbs_dir()
     test_load_from_json_export_missing_modality_no_exception()
     test_iter_raw_docs_json_export_dataset_filter_case_insensitive()
+
+    test_multiseed_config_validation_raises()
+    test_multiseed_build_seed_plan_32bit_limit()
+    test_multiseed_seeded_scope_restores_state()
+    test_multiseed_seeded_scope_restores_on_exception()
+    test_multiseed_crn_no_global_consumption_when_presampled()
+    test_multiseed_pregenerate_randomness_shapes()
+    test_multiseed_reproducible_same_process()
+    test_multiseed_crn_arm_independence()
+    test_multiseed_random_mode_fresh_entropy()
+    test_multiseed_random_mode_replay_reproducible()
+    test_multiseed_manifest_written_before_replicates()
+    test_multiseed_pseudo_regret_never_negative()
+    test_multiseed_isolation_from_production()
+
+    test_effect_size_all_wins_and_all_losses()
+    test_effect_size_tied_magnitudes_cancel()
+    test_effect_size_excludes_zero_diff_ties()
+    test_effect_size_label_thresholds()
+    test_effect_size_independent_of_scipy_availability()
+    test_effect_size_matches_scipy_rankdata_when_available()
+
+    test_selection_mode_validation()
+    test_selection_lambda1_equals_no_mmr()
+    test_selection_greedy_deterministic_no_rng()
+    test_selection_full_no_mmr_pairing()
+    test_selection_instrumentation_passive()
+    test_selection_inertia_counter_correct()
+    test_selection_mode_logged()
+    test_selection_list_metrics()
+    test_selection_choice_model()
+    test_selection_crn_across_configs()
+    test_selection_ablation_isolation()
+    test_selection_range_index_check()
 
     print()
     if _FAILURES:

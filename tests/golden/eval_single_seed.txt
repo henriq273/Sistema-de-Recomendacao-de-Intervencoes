@@ -1,0 +1,66 @@
+Curadoria de segurança: 6445 -> 3600 itens (2845 excluídos)
+Catálogo carregado: 3600 itens seguros (2845 descartados: va_ausente=0, curadoria_seguranca=2845)
+- Sanity checks
+[1] Recomendações excedendo o tempo disponível: check INATIVO (TIME_FILTER_ENABLED=False -- Duracao não é filtrada nesta versão)
+[2] Proximidade ao alvo: 24/32 pares (curr,dest) com recomendação mais próxima do alvo que a média do catálogo (8 par(es) falhando)
+    pior caso: curr=5 dest=2 (recomendação 0.340 mais LONGE do alvo que a média)
+[3a] Controle (chamada idêntica, determinística): 0/10 diferentes (esperado: 0)
+[3b] curr varia DENTRO do mesmo grupo de guardrail: 0/12
+[3c] curr varia ENTRE grupos de guardrail: 8/16
+     (3b baixo = o estado atual influencia pouco além do guardrail; depende de ISO_ALPHA e do peso da DQN no score híbrido)
+[4] Guardrail: 3271/3600 itens bloqueados para o oitante 5 (threshold arousal=-0.526, threshold valência aversiva=-0.400)
+[5] Chamadas idênticas com listas diferentes: 12/20
+[6] Cobertura de catálogo na grade completa: 89/3600 itens (TOP_K=3)
+
+- Cobertura e diversidade
+Cobertura de catálogo: 0.024
+Diversidade intra-lista média: 0.107
+Itens mais recomendados:
+  DEAM 0498: 48
+  GAPED P018: 48
+  GAPED P023: 48
+  DEAM 0456: 32
+  DEAM 1118: 32
+
+- Uso da escala de feedback (simulador holdout)
+  [1] Muito ruim / piorou bastante        33  (1.7%)
+  [2] Ruim / não funcionou               666  (33.3%)
+  [3] Indiferente / ok / razoável        626  (31.3%)
+  [4] Bom / funcionou                    635  (31.8%)
+  [5] Muito bom / muito eficaz            40  (2.0%)
+
+- Baselines (simulador holdout)
+  aleatorio        recompensa média = -0.002  IC95%=[-0.018, +0.015]  (n=3000)
+  mais_popular     recompensa média = +0.034  IC95%=[+0.016, +0.051]  (n=3000)
+  conteudo_puro    recompensa média = +0.396  IC95%=[+0.384, +0.407]  (n=3000)
+  agent_online     recompensa média = +0.467  IC95%=[+0.456, +0.478]  (n=3000)
+
+- Calibração da cabeça categórica (simulador holdout)
+  confiança∈[0.2,0.3) n=   4  conf.média=0.291  acerto=0.750
+  confiança∈[0.3,0.4) n= 841  conf.média=0.378  acerto=0.328
+  confiança∈[0.4,0.5) n=1985  conf.média=0.443  acerto=0.517
+  confiança∈[0.5,0.6) n= 162  conf.média=0.522  acerto=0.698
+  confiança∈[0.6,0.7) n=   7  conf.média=0.669  acerto=0.000
+  confiança∈[0.7,0.8) n=   1  conf.média=0.701  acerto=0.000
+  Erro de calibração esperado (ECE) = 0.075
+
+=== Regret cumulativo (agente vs. oráculo, simulador holdout) ===
+  Regret cumulativo final: 189.00 em 1000 episódios
+  Regret médio por episódio, primeiros 100: 0.5100
+  Regret médio por episódio, últimos 100: 0.0650
+  (queda entre os dois números = evidência de aprendizado/convergência; estagnado = platô)
+
+
+=== Heatmap 8x8: recompensa média por (oitante atual, oitante desejado) ===
+curr\dest      1      2      3      4      5      6      7      8
+        1   0.00   0.00   0.50   0.50   0.57   0.57   0.50   0.50
+        2   0.47   0.00   0.50   0.50   0.70   0.63   0.50   0.50
+        3   0.50   0.20   0.00   0.50   0.53   0.53   1.00   0.53
+        4   0.53   0.50  -0.50   0.00   0.50   0.50   0.60   0.57
+        5   0.50   0.00  -0.60  -0.53   0.00   0.27   0.50   0.77
+        6   0.13  -0.37  -0.53  -0.43   0.00   0.00   0.50   0.50
+        7   0.53   0.57   0.53   0.60   0.13   0.30   0.00   0.00
+        8   0.43   0.50   0.63   0.53   0.50   0.57   0.27   0.00
+
+  Pior célula: -0.60  |  Melhor célula: 1.00
+  Desvio-padrão entre células: 0.348 (alto = desempenho desigual pelo plano afetivo)

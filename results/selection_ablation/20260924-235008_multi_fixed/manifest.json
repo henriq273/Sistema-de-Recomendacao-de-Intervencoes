@@ -1,0 +1,126 @@
+{
+  "seed_mode": "multi_fixed",
+  "root_entropy": "42",
+  "replicates": [
+    {
+      "replicate_id": 0,
+      "global_seed": 3142992634
+    },
+    {
+      "replicate_id": 1,
+      "global_seed": 1174127800
+    },
+    {
+      "replicate_id": 2,
+      "global_seed": 1587909317
+    },
+    {
+      "replicate_id": 3,
+      "global_seed": 2553837471
+    },
+    {
+      "replicate_id": 4,
+      "global_seed": 2195756909
+    },
+    {
+      "replicate_id": 5,
+      "global_seed": 1650807020
+    },
+    {
+      "replicate_id": 6,
+      "global_seed": 596529004
+    },
+    {
+      "replicate_id": 7,
+      "global_seed": 809467331
+    },
+    {
+      "replicate_id": 8,
+      "global_seed": 2614043670
+    },
+    {
+      "replicate_id": 9,
+      "global_seed": 2735257765
+    }
+  ],
+  "configs": [
+    {
+      "name": "greedy",
+      "mode": "greedy",
+      "mmr_lambda": null
+    },
+    {
+      "name": "no_mmr",
+      "mode": "no_mmr",
+      "mmr_lambda": null
+    },
+    {
+      "name": "full@1",
+      "mode": "full",
+      "mmr_lambda": 1.0
+    },
+    {
+      "name": "full@0.9",
+      "mode": "full",
+      "mmr_lambda": 0.9
+    },
+    {
+      "name": "full@0.8",
+      "mode": "full",
+      "mmr_lambda": 0.8
+    },
+    {
+      "name": "full@0.7",
+      "mode": "full",
+      "mmr_lambda": 0.7
+    },
+    {
+      "name": "full@0.5",
+      "mode": "full",
+      "mmr_lambda": 0.5
+    },
+    {
+      "name": "full@0.3",
+      "mode": "full",
+      "mmr_lambda": 0.3
+    }
+  ],
+  "production_selection_mode": "full",
+  "production_mmr_lambda": 0.7,
+  "affinity_scales": [
+    0.0,
+    0.1,
+    0.25,
+    0.5
+  ],
+  "chooser_temperature": 0.2,
+  "regimes": [
+    "cold",
+    "warm"
+  ],
+  "n_contexts_per_replicate": 200,
+  "warm_train_episodes": 1000,
+  "config": {
+    "BATCH_SIZE": 8,
+    "WARMUP_INTERACTIONS": 45,
+    "LEARNING_RATE": 0.0005,
+    "WEIGHT_DECAY": 1e-05,
+    "GAMMA": 0.99,
+    "UPDATES_PER_FEEDBACK": 3,
+    "ISO_ALPHA": 1.0,
+    "CANDIDATE_POOL_SIZE": 12,
+    "SAFETY_AROUSAL_THRESHOLD": -0.526,
+    "SAFETY_AVERSIVE_VALENCE_THRESHOLD": -0.4,
+    "TIME_FILTER_ENABLED": false,
+    "FATIGUE_MIN_GAP": 3,
+    "TOP_K": 3,
+    "MULTISEED_INCLUDE_WARMSTART": false,
+    "MULTISEED_INCLUDE_REGRET": false,
+    "N_EPISODES_PER_REPLICATE": 3000,
+    "N_REPLICATES": 10,
+    "FINAL_WINDOW_FRACTION": 0.2
+  },
+  "catalog_fingerprint": "a0175e4c3f9dc15d",
+  "git_commit": "5f95d5c6c6e7e8a7e4abb7668ea5ae8ef18bb4be",
+  "started_at_utc": "2026-09-24T23:50:08.784605+00:00"
+}
