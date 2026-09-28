@@ -56,7 +56,7 @@ SEED = 42
 # "single"       -> caminho legado intocado, uma execução com SEED (padrão)
 # "multi_fixed"  -> N réplicas, seeds derivadas deterministicamente de SEED
 # "multi_random" -> N réplicas, seed raiz obtida de entropia do SO e registrada
-SEED_MODE = "single"
+SEED_MODE = "multi_fixed"
 
 N_REPLICATES = 10                 # >= 6 para Wilcoxon bilateral poder atingir p<0,05
 N_EPISODES_PER_REPLICATE = 3000

@@ -429,7 +429,18 @@ python sistema_de_recomendacao_v3.py --eval   # dispara multiseed.py quando SEED
   impossível saber se uma diferença veio do código ou das seeds.
 - **Comparação pareada** (`agent_online` vs. `conteudo_puro`, na janela final de
   episódios) via teste de Wilcoxon pareado (`scipy`, dependência só desta bancada)
-  ou teste do sinal exato como *fallback* sem dependência.
+  ou teste do sinal exato como *fallback* sem dependência. Além do p-valor, é
+  reportado um **tamanho de efeito**: correlação rank-biserial pareada
+  (`multiseed.rank_biserial_correlation`, companheira do Wilcoxon signed-rank —
+  às vezes chamada informalmente de "delta de Cliff pareado", mas não é o delta
+  de Cliff clássico de amostras independentes), calculada manualmente a partir
+  dos postos de `|diferença|` (com posto médio nos empates de magnitude) sem
+  chamar `scipy.stats.rankdata` — por isso o valor é **idêntico com ou sem
+  `scipy` instalado**; só o teste de significância (`wilcoxon` vs. `sign_test`)
+  muda de método. Interpretação textual usando os limiares de
+  Vargha-Delaney/Romano et al. (0,147 / 0,33 / 0,474), com a ressalva de que
+  foram definidos para o delta de Cliff clássico — convenção de leitura
+  emprestada, não equivalência estatística provada.
 - **Pseudo-regret** opcional (`MULTISEED_INCLUDE_REGRET`): diferente do regret
   cumulativo de `regret_curve` (que compara contra recompensa **realizada**, e
   pode ser negativo por ruído amostral), o pseudo-regret compara valor esperado
@@ -474,7 +485,9 @@ com **afinidade latente por modalidade** (varredura de escala `0 / 0,1 / 0,25 /
 0,5` — uma hipótese sobre o usuário, não um dado; reportar sempre a varredura
 inteira). Segue `SEED_MODE`: em `"single"`, uma réplica, valores descritivos; em
 `"multi_fixed"`/`"multi_random"`, comparações pareadas por réplica (`full − no_mmr`,
-`no_mmr − greedy`, `full − greedy`). Resultados em
+`no_mmr − greedy`, `full − greedy`), uma por métrica, cada uma já com o tamanho de
+efeito (rank-biserial pareada, ver seção de `multiseed.py` acima) herdado de
+`multiseed.paired_comparison`. Resultados em
 `results/selection_ablation/<timestamp>_<modo>/` (manifesto gravado antes de rodar).
 
 Garantias verificadas por teste: com `λ = 1,0`, `full` retorna exatamente as

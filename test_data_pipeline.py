@@ -1481,6 +1481,142 @@ def _random_contexts(n: int, seed: int = 123):
              int(rng.integers(0, 2**31))) for _ in range(n)]
 
 
+# ---------- Tamanho de efeito nas comparações pareadas (multiseed.paired_comparison) ----------
+
+
+def test_effect_size_all_wins_and_all_losses():
+    """rank_biserial == 1.0 quando A vence em toda réplica sem empate de
+    magnitude (nenhum posto se cancela); == -1.0 no espelho -- confirma o sinal:
+    positivo quando A tende a vencer B."""
+    a_wins = np.array([5.0, 3.0, 8.0, 1.0, 6.0])
+    b = np.array([1.0, 1.0, 1.0, 0.5, 1.0])
+    c = multiseed.paired_comparison(a_wins, b, "a", "b")
+    _check("effect size: A vence em todas as réplicas -> rank_biserial == 1.0",
+           c["rank_biserial"] == 1.0 and c["effect_label"] == "grande",
+           f"{c}")
+
+    c2 = multiseed.paired_comparison(b, a_wins, "b", "a")
+    _check("effect size: espelho (B perde em todas) -> rank_biserial == -1.0",
+           c2["rank_biserial"] == -1.0, f"{c2}")
+
+
+def test_effect_size_tied_magnitudes_cancel():
+    """diffs=[2,-2,1,-1]: dois pares de magnitude empatada com sinal oposto --
+    os postos médios dos blocos empatados cancelam exatamente -> rank_biserial == 0.0.
+    Cobre o desempate de magnitude (mid-rank) com resultado analítico conhecido."""
+    a = np.array([2.0, -2.0, 1.0, -1.0])
+    zero = np.zeros(4)
+    c = multiseed.paired_comparison(a, zero, "a", "zero")
+    _check("effect size: pares de magnitude empatada e sinal oposto -> rank_biserial == 0.0",
+           c["rank_biserial"] == 0.0 and c["effect_label"] == "negligível", f"{c}")
+
+
+def test_effect_size_excludes_zero_diff_ties():
+    """diffs=[0,0,5,3,-1]: as duas réplicas empatadas (diff=0) ficam fora do
+    ranking e do denominador -- effect_n_pairs=3 (não 5). Conferido à mão:
+    |diffs| não-nulos ordenados = [1,3,5] (sem empate de magnitude) -> W+=rank(3)+rank(5)=2+3=5,
+    W-=rank(1)=1, T=W++W-=6=n(n+1)/2 com n=3 -> r=(5-1)/6=2/3."""
+    a = np.array([5.0, 3.0, 0.0, 4.0, 0.0])
+    b = np.array([0.0, 0.0, 0.0, 5.0, 0.0])   # diffs = [5, 3, 0, -1, 0]
+    c = multiseed.paired_comparison(a, b, "a", "b")
+    _check("effect size: réplicas empatadas (diff=0) excluídas do denominador",
+           c["ties"] == 2 and c["effect_n_pairs"] == 3, f"{c}")
+    _check("effect size: valor conferido à mão (W+=5, W-=1, T=6 -> r=2/3)",
+           abs(c["rank_biserial"] - 2 / 3) < 1e-9, f"{c}")
+
+
+def test_effect_size_label_thresholds():
+    """Os quatro rótulos de interpretação, nos limiares e em seus negativos
+    (abs() -- o sinal não afeta o rótulo), e o rótulo especial quando
+    effect_n_pairs == 0 (todas as réplicas empataram -- não é 'negligível')."""
+    cases = [
+        (0.05, "negligível"), (-0.05, "negligível"),
+        (0.2, "pequeno"), (-0.2, "pequeno"),
+        (0.4, "médio"), (-0.4, "médio"),
+        (0.6, "grande"), (-0.6, "grande"),
+    ]
+    ok = all(multiseed.effect_size_label(r, n_pairs=5) == label for r, label in cases)
+    _check("effect_size_label: os quatro rótulos batem nos limiares e seus negativos", ok,
+           f"{[(r, multiseed.effect_size_label(r, 5)) for r, _ in cases]}")
+    _check("effect_size_label: n_pairs=0 -> rótulo especial, não 'negligível'",
+           multiseed.effect_size_label(0.0, n_pairs=0) == "sem diferença (todas as réplicas empataram)")
+
+
+def test_effect_size_independent_of_scipy_availability():
+    """O valor do effect size (rank_biserial/effect_label/effect_n_pairs) nunca
+    chama scipy.stats.rankdata -- não deveria variar com o que está instalado no
+    ambiente. Forçar _HAVE_SCIPY=True só é seguro quando scipy está DE FATO
+    instalado (senão `wilcoxon`, importado condicionalmente no topo do módulo,
+    nunca foi vinculado, e chamá-lo lançaria NameError -- não um sinal de que o
+    effect size depende de scipy, só de que o ramo de teste de significância
+    genuinamente precisa dele). Por isso:
+      1. sempre confere que paired_comparison() bate com rank_biserial_correlation()
+         chamada direto, no estado REAL do ambiente (nunca tautológico: prova que a
+         função de comparação não recalcula nada diferente por fora);
+      2. só força o outro valor de _HAVE_SCIPY quando isso for seguro -- ida de
+         True->False é sempre segura (o ramo False nunca precisa de scipy); a
+         volta False->True só roda se scipy estiver genuinamente presente."""
+    a = np.array([5.0, -2.0, 3.0, 1.0, -4.0, 6.0, 0.0, 2.0])
+    b = np.zeros(8)
+    expected_r, expected_n = multiseed.rank_biserial_correlation(a - b)
+
+    natural = multiseed.paired_comparison(a, b, "a", "b")
+    _check("effect size de paired_comparison() bate com rank_biserial_correlation() "
+          "direta, no estado real do ambiente",
+           natural["rank_biserial"] == expected_r and natural["effect_n_pairs"] == expected_n,
+           f"natural={natural} expected=({expected_r}, {expected_n})")
+
+    original = multiseed._HAVE_SCIPY
+    if not original:
+        # scipy genuinamente ausente: forçar True chamaria `wilcoxon`, nunca
+        # vinculado (import condicional no topo do módulo) -- NameError não
+        # provaria nada sobre o effect size, só a falta real da dependência.
+        # A única direção segura de testar (True -> False) precisa de scipy
+        # real instalado; ver test_effect_size_matches_scipy_rankdata_when_available
+        # para a validação cruzada quando ele estiver presente.
+        _check("scipy ausente neste ambiente -- ramo _HAVE_SCIPY=True não pode "
+              "ser exercitado com segurança (ver teste de validação cruzada)", True)
+        return
+
+    try:
+        multiseed._HAVE_SCIPY = False
+        flipped = multiseed.paired_comparison(a, b, "a", "b")
+    finally:
+        multiseed._HAVE_SCIPY = original
+    same_effect_size = (
+        flipped["rank_biserial"] == natural["rank_biserial"]
+        and flipped["effect_label"] == natural["effect_label"]
+        and flipped["effect_n_pairs"] == natural["effect_n_pairs"]
+    )
+    _check("effect size idêntico ao forçar _HAVE_SCIPY=False (scipy está instalado "
+          "neste ambiente, então a ida True->False é segura de testar)",
+           same_effect_size, f"natural={natural} flipped={flipped}")
+
+
+def test_effect_size_matches_scipy_rankdata_when_available():
+    """Validação cruzada, só roda se scipy já estiver instalado: recomputa W+/T
+    via scipy.stats.rankdata (implementação de referência) de forma
+    independente e confere igualdade com rank_biserial_correlation -- sem criar
+    dependência nova, só valida a implementação manual de ranking quando scipy
+    já está presente no ambiente de teste."""
+    if not multiseed._HAVE_SCIPY:
+        _check("effect size bate com scipy.stats.rankdata (scipy indisponível -- pulado)", True)
+        return
+    from scipy.stats import rankdata
+    rng = np.random.default_rng(99)
+    diffs = rng.normal(size=30)
+    diffs[diffs.round(3) == 0] = 0.1  # evita zeros espúrios de ponto flutuante
+    nonzero = diffs[diffs != 0]
+    ranks = rankdata(np.abs(nonzero), method="average")
+    w_pos_ref = float(ranks[nonzero > 0].sum())
+    w_neg_ref = float(ranks[nonzero < 0].sum())
+    r_ref = (w_pos_ref - w_neg_ref) / (w_pos_ref + w_neg_ref)
+    r, n_pairs = multiseed.rank_biserial_correlation(diffs)
+    _check("effect size bate com scipy.stats.rankdata (implementação de referência)",
+           abs(r - r_ref) < 1e-9 and n_pairs == len(nonzero),
+           f"r={r} r_ref={r_ref} n_pairs={n_pairs}")
+
+
 def test_selection_mode_validation():
     """Teste 7: SELECTION_MODE inválido levanta ValueError na importação --
     verificado executando o código-fonte REAL do módulo com o valor trocado (não
@@ -1813,6 +1949,13 @@ def main() -> None:
     test_multiseed_manifest_written_before_replicates()
     test_multiseed_pseudo_regret_never_negative()
     test_multiseed_isolation_from_production()
+
+    test_effect_size_all_wins_and_all_losses()
+    test_effect_size_tied_magnitudes_cancel()
+    test_effect_size_excludes_zero_diff_ties()
+    test_effect_size_label_thresholds()
+    test_effect_size_independent_of_scipy_availability()
+    test_effect_size_matches_scipy_rankdata_when_available()
 
     test_selection_mode_validation()
     test_selection_lambda1_equals_no_mmr()

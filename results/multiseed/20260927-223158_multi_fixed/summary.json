@@ -1,0 +1,192 @@
+{
+  "manifest": {
+    "mode": "multi_fixed",
+    "root_entropy": "42",
+    "replicates": [
+      {
+        "replicate_id": 0,
+        "global_seed": 3142992634
+      },
+      {
+        "replicate_id": 1,
+        "global_seed": 1174127800
+      },
+      {
+        "replicate_id": 2,
+        "global_seed": 1587909317
+      },
+      {
+        "replicate_id": 3,
+        "global_seed": 2553837471
+      },
+      {
+        "replicate_id": 4,
+        "global_seed": 2195756909
+      },
+      {
+        "replicate_id": 5,
+        "global_seed": 1650807020
+      },
+      {
+        "replicate_id": 6,
+        "global_seed": 596529004
+      },
+      {
+        "replicate_id": 7,
+        "global_seed": 809467331
+      },
+      {
+        "replicate_id": 8,
+        "global_seed": 2614043670
+      },
+      {
+        "replicate_id": 9,
+        "global_seed": 2735257765
+      }
+    ],
+    "n_episodes_per_replicate": 3000,
+    "config": {
+      "BATCH_SIZE": 8,
+      "WARMUP_INTERACTIONS": 45,
+      "LEARNING_RATE": 0.0005,
+      "WEIGHT_DECAY": 1e-05,
+      "GAMMA": 0.99,
+      "UPDATES_PER_FEEDBACK": 3,
+      "ISO_ALPHA": 1.0,
+      "CANDIDATE_POOL_SIZE": 12,
+      "SAFETY_AROUSAL_THRESHOLD": -0.526,
+      "SAFETY_AVERSIVE_VALENCE_THRESHOLD": -0.4,
+      "TIME_FILTER_ENABLED": false,
+      "FATIGUE_MIN_GAP": 3,
+      "TOP_K": 3,
+      "MULTISEED_INCLUDE_WARMSTART": false,
+      "MULTISEED_INCLUDE_REGRET": false,
+      "N_EPISODES_PER_REPLICATE": 3000,
+      "N_REPLICATES": 10,
+      "FINAL_WINDOW_FRACTION": 0.2
+    },
+    "catalog_fingerprint": "a0175e4c3f9dc15d",
+    "git_commit": "61d4a8dc46716606ce2e43ccde662c10e1d63362",
+    "started_at_utc": "2026-09-27T22:31:58.865855+00:00"
+  },
+  "summary_by_arm": {
+    "aleatorio": {
+      "run_mean": {
+        "mean": 0.043566666543483734,
+        "std": 0.005969459822768264,
+        "min": 0.031833332031965256,
+        "max": 0.050833333283662796
+      },
+      "final_window_mean": {
+        "mean": 0.047500000521540645,
+        "std": 0.015951314436185235,
+        "min": 0.02666666731238365,
+        "max": 0.07333333045244217
+      },
+      "per_replicate_final_window_mean": [
+        0.06666667014360428,
+        0.07333333045244217,
+        0.03916666656732559,
+        0.03750000149011612,
+        0.034166667610406876,
+        0.042500000447034836,
+        0.02666666731238365,
+        0.03500000014901161,
+        0.07083333283662796,
+        0.04916666820645332
+      ]
+    },
+    "mais_popular": {
+      "run_mean": {
+        "mean": 0.2419333353638649,
+        "std": 0.006559642730754539,
+        "min": 0.2241666615009308,
+        "max": 0.2475000023841858
+      },
+      "final_window_mean": {
+        "mean": 0.24283333420753478,
+        "std": 0.012411912169960267,
+        "min": 0.22833333909511566,
+        "max": 0.2666666805744171
+      },
+      "per_replicate_final_window_mean": [
+        0.2408333271741867,
+        0.22833333909511566,
+        0.23250000178813934,
+        0.25,
+        0.2666666805744171,
+        0.2574999928474426,
+        0.25083333253860474,
+        0.23250000178813934,
+        0.2408333271741867,
+        0.22833333909511566
+      ]
+    },
+    "conteudo_puro": {
+      "run_mean": {
+        "mean": 0.3985666662454605,
+        "std": 0.0064602209933171855,
+        "min": 0.39133334159851074,
+        "max": 0.4111666679382324
+      },
+      "final_window_mean": {
+        "mean": 0.40366666316986083,
+        "std": 0.01011187409412016,
+        "min": 0.3858333230018616,
+        "max": 0.41499999165534973
+      },
+      "per_replicate_final_window_mean": [
+        0.41083332896232605,
+        0.41499999165534973,
+        0.4000000059604645,
+        0.41333332657814026,
+        0.3891666531562805,
+        0.41333332657814026,
+        0.41083332896232605,
+        0.3858333230018616,
+        0.3958333432674408,
+        0.4025000035762787
+      ]
+    },
+    "agent_online": {
+      "run_mean": {
+        "mean": 0.44536666572093964,
+        "std": 0.06950219790516009,
+        "min": 0.27649998664855957,
+        "max": 0.5366666913032532
+      },
+      "final_window_mean": {
+        "mean": 0.48225000202655793,
+        "std": 0.07080984764910792,
+        "min": 0.3016666769981384,
+        "max": 0.5616666674613953
+      },
+      "per_replicate_final_window_mean": [
+        0.5616666674613953,
+        0.4883333444595337,
+        0.41499999165534973,
+        0.49166667461395264,
+        0.5458333492279053,
+        0.49416667222976685,
+        0.5049999952316284,
+        0.3016666769981384,
+        0.5233333110809326,
+        0.4958333373069763
+      ]
+    }
+  },
+  "comparison_agent_vs_content": {
+    "label": "agent_online - conteudo_puro",
+    "mean_diff": 0.07858333885669708,
+    "std_diff": 0.06688303215592953,
+    "wins": 9,
+    "losses": 1,
+    "ties": 0,
+    "p_value": 0.021484375,
+    "test": "sign_test (scipy indisponível)",
+    "rank_biserial": 0.8181818181818182,
+    "effect_n_pairs": 10,
+    "effect_label": "grande"
+  },
+  "n_replicates": 10
+}

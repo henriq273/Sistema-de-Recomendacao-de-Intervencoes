@@ -399,12 +399,95 @@ def sign_test_p(wins: int, losses: int) -> float:
     return min(1.0, 2 * p)
 
 
+def _signed_rank_sums(diffs: np.ndarray) -> tuple[float, float, int]:
+    """Postos de |diff| entre as réplicas com diff != 0 (diff == 0 é excluído do
+    ranking -- mesmo comportamento de zero_method="wilcox", padrão de
+    scipy.stats.wilcoxon, e do que sign_test_p já faz ao descartar empates).
+    Empates de MAGNITUDE (duas réplicas distintas com o mesmo |diff|) recebem o
+    posto médio do bloco (mid-rank) -- método padrão de desempate do Wilcoxon
+    signed-rank, o que garante que W+/W- batam com scipy quando ele está
+    disponível. Retorna (W+, W-, n_pares_não_empatados)."""
+    nonzero = diffs[diffs != 0]
+    n = len(nonzero)
+    if n == 0:
+        return 0.0, 0.0, 0
+    abs_diffs = np.abs(nonzero)
+    order = np.argsort(abs_diffs, kind="stable")
+    sorted_abs = abs_diffs[order]
+
+    ranks = np.empty(n, dtype=np.float64)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and sorted_abs[j + 1] == sorted_abs[i]:
+            j += 1
+        # bloco [i, j] empatado em magnitude -> posto médio (1-based)
+        mid_rank = (i + 1 + j + 1) / 2.0
+        ranks[i:j + 1] = mid_rank
+        i = j + 1
+
+    rank_by_original_pos = np.empty(n, dtype=np.float64)
+    rank_by_original_pos[order] = ranks
+    w_pos = float(rank_by_original_pos[nonzero > 0].sum())
+    w_neg = float(rank_by_original_pos[nonzero < 0].sum())
+    return w_pos, w_neg, n
+
+
+def rank_biserial_correlation(diffs: np.ndarray) -> tuple[float, int]:
+    """Correlação rank-biserial PAREADA (Kerby 2014): r = (W+ - W-) / (W+ + W-),
+    o tamanho de efeito companheiro do teste de Wilcoxon signed-rank -- às vezes
+    chamado, na literatura de engenharia de software, de "delta de Cliff pareado".
+    NÃO é o delta de Cliff clássico (Cliff, 1993): aquele soma sobre TODOS os
+    pares cruzados de duas amostras INDEPENDENTES; este usa só os n pares
+    casados pelo mesmo replicate_id/seed (CRN), que é a estrutura real do nosso
+    desenho experimental. Calculado manualmente (ver _signed_rank_sums), sem
+    scipy.stats.rankdata -- por isso o valor é IDÊNTICO com ou sem scipy
+    instalado; só o p-valor que o acompanha muda de método (wilcoxon vs.
+    sign_test) conforme a disponibilidade de scipy. Retorna (r, n_pares), com
+    n_pares = réplicas com diff != 0 (empates de diff==0 ficam fora, como em
+    paired_comparison)."""
+    w_pos, w_neg, n = _signed_rank_sums(diffs)
+    if n == 0:
+        return 0.0, 0
+    return (w_pos - w_neg) / (w_pos + w_neg), n
+
+
+EFFECT_SIZE_THRESHOLDS = (0.147, 0.33, 0.474)  # negligível / pequeno / médio / grande
+EFFECT_SIZE_NOTE = (
+    "tamanho de efeito = correlação rank-biserial PAREADA (companheira do Wilcoxon "
+    "signed-rank, não o delta de Cliff clássico de amostras independentes -- ver "
+    "docstring de rank_biserial_correlation); limiares de interpretação "
+    "(negligível/pequeno/médio/grande) emprestados de Vargha-Delaney/Romano et al., "
+    "definidos para o delta de Cliff clássico -- convenção de leitura, não "
+    "equivalência estatística provada."
+)
+
+
+def effect_size_label(r: float, n_pairs: int) -> str:
+    if n_pairs == 0:
+        return "sem diferença (todas as réplicas empataram)"
+    a = abs(r)
+    neg, small, medium = EFFECT_SIZE_THRESHOLDS
+    if a < neg:
+        return "negligível"
+    if a < small:
+        return "pequeno"
+    if a < medium:
+        return "médio"
+    return "grande"
+
+
 def paired_comparison(final_a: np.ndarray, final_b: np.ndarray, label_a: str, label_b: str) -> dict:
     """Comparação pareada por replicate_id, na janela final. A comparação
     principal do relatório é agent_online - conteudo_puro; aleatorio/mais_popular
     são descritivos (declarar a hipótese principal de antemão evita a questão de
     comparações múltiplas -- se as quatro forem testadas formalmente, aplicar
-    correção de Holm)."""
+    correção de Holm).
+
+    Além do p-valor, reporta um tamanho de efeito (rank_biserial, ver
+    rank_biserial_correlation) -- diferente do p-valor, ele independe de scipy
+    estar instalado: é sempre a mesma conta, sobre os mesmos postos. Só o TESTE
+    de significância (test/p_value) muda de método conforme _HAVE_SCIPY."""
     diffs = final_a - final_b
     wins = int((diffs > 0).sum())
     losses = int((diffs < 0).sum())
@@ -421,12 +504,16 @@ def paired_comparison(final_a: np.ndarray, final_b: np.ndarray, label_a: str, la
         p = sign_test_p(wins, losses)
         test_name = "sign_test" if _HAVE_SCIPY else "sign_test (scipy indisponível)"
 
+    r, n_pairs = rank_biserial_correlation(diffs)
+
     return {
         "label": f"{label_a} - {label_b}",
         "mean_diff": float(diffs.mean()),
         "std_diff": float(diffs.std()),
         "wins": wins, "losses": losses, "ties": ties,
         "p_value": float(p), "test": test_name,
+        "rank_biserial": r, "effect_n_pairs": n_pairs,
+        "effect_label": effect_size_label(r, n_pairs),
     }
 
 
@@ -469,6 +556,9 @@ def _print_report(summary: dict, comparison: dict, curve_agent: dict, curve_cont
     print(f"  vitórias/derrotas/empates do agente: "
           f"{comparison['wins']}/{comparison['losses']}/{comparison['ties']}")
     print(f"  teste: {comparison['test']}  p-valor={comparison['p_value']:.4f}")
+    print(f"  tamanho de efeito: r={comparison['rank_biserial']:+.3f} "
+          f"[{comparison['effect_label']}]  (n_pares={comparison['effect_n_pairs']})")
+    print(f"  {EFFECT_SIZE_NOTE}")
 
     print("\n=== Curva de aprendizado (média entre réplicas, agent_online vs. conteudo_puro) ===")
     print(f"{'episódio':>10} {'agent_online':>14} {'conteudo_puro':>14}")

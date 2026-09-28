@@ -360,7 +360,9 @@ def _print_report(summary: dict, inertia_now: dict, configs: list, n_replicates:
                 for metric, c in per_metric.items():
                     print(f"      {metric:>22}: diff={c['mean_diff']:+.4f} (dp={c['std_diff']:.4f}) "
                           f"V/D/E={c['wins']}/{c['losses']}/{c['ties']} "
-                          f"p={c['p_value']:.4f} [{c['test']}]")
+                          f"p={c['p_value']:.4f} [{c['test']}]  "
+                          f"r={c['rank_biserial']:+.3f} [{c['effect_label']}]")
+            print(f"  {multiseed.EFFECT_SIZE_NOTE}")
         else:
             print("\n  (uma réplica só -- SEED_MODE='single': valores descritivos, sem teste)")
 
